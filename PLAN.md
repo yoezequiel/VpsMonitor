@@ -185,17 +185,19 @@ Objetivo: un usuario instala Monitor+Agent en su máquina, añade un segundo Age
 
 ### Fase 2 — V2: observabilidad y alertas (según sección 42)
 
-- [ ] Docker monitoring (collector vía Docker API: contenedores, estado, cpu/mem/red, reinicios).
-- [ ] Health checks HTTP/HTTPS/TCP/Ping/DNS + scheduler de ejecución periódica.
-- [ ] Motor de reglas de alertas (umbral + duración, ej. "CPU > 90% for 5 minutes") con evaluación en el scheduler.
-- [ ] Notificadores: Email (SMTP), Webhook genérico.
-- [ ] Agrupación automática de alertas relacionadas en incidentes + timeline.
-- [ ] Tags en servidores + filtrado en dashboard/CLI.
-- [ ] Grupos de servidores.
-- [ ] Vista de logs (Agent/Monitor/Docker) con filtros por fecha/nivel/servidor/texto.
-- [ ] Retención/downsampling real de `metrics` (crudo → agregados) para no crecer sin control.
+- [x] Docker monitoring (collector vía Docker API: contenedores, estado, cpu/mem/red, reinicios). Backend + reporte del Agent completos; sin UI en el dashboard todavía.
+- [x] Health checks HTTP/HTTPS/TCP/Ping/DNS + scheduler de ejecución periódica. Ping vía socket ICMP sin privilegios (`surge-ping`); backend + API completos, sin UI en el dashboard todavía.
+- [x] Motor de reglas de alertas (umbral + duración, ej. "CPU > 90% for 5 minutes") con evaluación en el scheduler.
+- [x] Notificadores: Email (SMTP vía `lettre`), Webhook genérico.
+- [x] Agrupación automática de alertas relacionadas en incidentes + timeline.
+- [x] Tags en servidores + filtrado. Filtrado por API (`?tags=`) y CLI (`monitor server add`/API `PATCH tags`); sin UI en el dashboard todavía.
+- [x] Grupos de servidores. CRUD + membresía por API; sin UI en el dashboard todavía.
+- [ ] Vista de logs (Agent/Monitor/Docker) con filtros por fecha/nivel/servidor/texto. **Diferido**: requiere una infraestructura de log-shipping (el Agent no captura ni envía sus propios logs, el Monitor no persiste los suyos) que es un subsistema propio, no una extensión menor de lo ya construido.
+- [x] Retención/downsampling real de `metrics` (crudo → agregados) para no crecer sin control.
 
-**Criterio de salida**: una regla de alerta dispara un webhook real cuando un contenedor se detiene o un health check falla, y aparece agrupada en un incidente con timeline coherente.
+**Criterio de salida**: ✅ verificado con un test de integración real (`alerting::tests::container_stopped_fires_webhook_and_opens_incident`) — una regla de alerta dispara un webhook real cuando un contenedor se detiene, y aparece agrupada en un incidente con timeline coherente que se resuelve solo cuando el contenedor vuelve.
+
+**Pendiente para cerrar V2 del todo**: UI en el dashboard para Docker/health checks/alertas/incidentes/tags/grupos (todo el backend y la API ya existen), y la vista de logs completa.
 
 ### Fase 3 — V3: automatización y seguridad avanzada (según sección 43)
 
