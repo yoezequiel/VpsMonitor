@@ -44,21 +44,14 @@ pub struct Metric {
     pub uptime_s: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Administrator,
-    Operator,
-    Viewer,
-}
-
+/// Flat permission model by design: any authenticated user has full
+/// access. No role tiers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: Uuid,
     pub username: String,
     #[serde(skip_serializing)]
     pub password_hash: String,
-    pub role: Role,
     pub created_at: DateTime<Utc>,
 }
 
