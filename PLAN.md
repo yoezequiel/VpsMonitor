@@ -8,7 +8,7 @@
 
 Puntos fuertes del planteamiento:
 
-- La distinción **Monitor / Agent / Monitor+Agent** es el núcleo arquitectónico correcto: todo lo demás (dashboard, alertas, RBAC) es una capa sobre esa relación cliente-servidor.
+- La distinción **Monitor / Agent / Monitor+Agent** es el núcleo arquitectónico correcto: todo lo demás (dashboard, alertas) es una capa sobre esa relación cliente-servidor.
 - El roadmap MVP → V2 → V3 → V4 ya está bien priorizado: primero observabilidad básica, después alertas/incidentes, después automatización/seguridad avanzada, y al final escalabilidad (Postgres, HA, clustering).
 - El principio "Agent no necesita puerto público" es correcto y condiciona el diseño de comunicación: debe ser **Agent → Monitor** (push), nunca al revés, salvo instalación remota por SSH (que es un flujo distinto, iniciado por el Monitor una única vez).
 
@@ -17,7 +17,7 @@ Riesgos / ambigüedades que este plan resuelve con una decisión explícita (mar
 - El documento no especifica el protocolo exacto Agent↔Monitor (REST puro vs REST+WebSocket vs gRPC). **[DECISIÓN]**: HTTPS/REST para heartbeat y métricas (simple, fácil de depurar, funciona detrás de NAT), WebSocket solo Monitor→Dashboard para tiempo real.
 - No se especifica el mecanismo de emparejamiento inicial Agent-Monitor (pairing). **[DECISIÓN]**: token de un solo uso generado por el Monitor (`monitor server add`), similar a como Tailscale/Wireguard hacen onboarding.
 - "Monitorización distribuida" (Monitor supervisando Monitor) reutiliza el mismo protocolo que Agent→Monitor, tratando un Monitor remoto como un Agent especial. Esto evita construir un segundo protocolo.
-- Multi-tenancy / RBAC por organización no se menciona explícitamente — se asume **una instalación = un tenant** (coherente con la filosofía self-hosted). RBAC es por usuario dentro de esa instalación, no multi-org.
+- Multi-tenancy no se contempla — **una instalación = un tenant** (coherente con la filosofía self-hosted). **[DECISIÓN DE PRODUCTO]**: no habrá RBAC/roles. Cualquier usuario autenticado tiene acceso total — modelo de permisos plano, no una limitación temporal del MVP. La sección 28 del documento original (RBAC de 3 roles) queda descartada.
 
 ---
 
@@ -57,7 +57,7 @@ vpsmonitor/
 │   │   ├── scheduler/           # health checks, evaluación de alertas, heartbeat timeout
 │   │   ├── alerting/             # reglas, evaluación, notificadores (email/webhook/discord/telegram)
 │   │   ├── incidents/             # agrupación de alertas en incidentes
-│   │   ├── auth/                    # tokens, RBAC, sesiones
+│   │   ├── auth/                    # tokens, sesiones (sin RBAC — acceso total si autenticado)
 │   │   ├── store/                    # trait Store + implementación sqlx (sqlite; postgres en V4)
 │   │   └── ssh/                        # instalación remota de Agent vía russh
 │   ├── agent-core/
@@ -129,7 +129,7 @@ Autenticación: cada Agent recibe, tras el registro, un **token Bearer de larga 
 - TLS obligatorio por defecto (certificado autofirmado generado en el primer arranque si no hay uno configurado; el usuario puede traer el suyo).
 - Tokens de Agent con hash almacenado (nunca en claro), rotables desde CLI/dashboard, revocables individualmente.
 - Rate limiting por IP/token en endpoints `/api/agent/*` y `/api/auth/*`.
-- RBAC de 3 roles fijos en MVP/V2 (Administrator, Operator, Viewer) tal como describe la sección 28; su enforcement vive en middleware central, no disperso por handler.
+- Sin RBAC (decisión de producto, ver sección 2 de este documento): cualquier usuario autenticado tiene acceso total. No hay roles ni niveles de permiso.
 - `audit_log` se escribe desde el mismo middleware de autorización para cualquier acción mutante — así no depende de que cada feature nueva "recuerde" auditar.
 
 ---
@@ -167,7 +167,7 @@ Objetivo: un usuario instala Monitor+Agent en su máquina, añade un segundo Age
 
 **1c. Monitor — API + auth**
 - [ ] `POST /api/agent/register`, `/heartbeat`, `/metrics` en `axum`.
-- [ ] Auth básica de usuario (login, sesión) — un único rol admin implícito en MVP, RBAC completo se difiere a V2/V3 sin bloquear el MVP.
+- [x] Auth básica de usuario (login, sesión) — sin roles: cualquier usuario autenticado tiene acceso total (decisión de producto, no un placeholder de MVP).
 - [ ] TLS con certificado autofirmado por defecto (`rustls` + `rcgen`).
 
 **1d. Dashboard**
@@ -201,7 +201,6 @@ Objetivo: un usuario instala Monitor+Agent en su máquina, añade un segundo Age
 
 - [ ] Instalación remota de Agent por SSH (subir binario, instalar servicio, generar credenciales, arrancar, health check — flujo de la sección 10).
 - [ ] Deployment tracking + correlación heurística deployment↔incidente (ventana de tiempo, sin causalidad automática).
-- [ ] RBAC completo (Administrator/Operator/Viewer) aplicado a API, CLI y dashboard.
 - [ ] Auditoría completa (audit_log) expuesta en UI/CLI.
 - [ ] Notificadores Discord y Telegram.
 - [ ] Monitorización distribuida: un Monitor puede añadir a otro Monitor como si fuera un Agent especial, reutilizando el protocolo de heartbeat/registro.
@@ -229,7 +228,7 @@ Esta fase se detalla más adelante, cuando V1–V3 estén validadas con uso real
 - **Unit tests** por crate (`collector`, `store`, `alerting`, `auth`) con `cargo test`, usando `mockall` o fakes manuales para aislar dependencias externas (Docker, red).
 - **Tests de integración** Monitor↔Agent usando instancias reales en Docker Compose (2-3 "servers" simulados) — clave para validar heartbeat/offline detection sin depender de infraestructura real; `sqlx` permite además tests contra una SQLite en memoria por caso de test.
 - **Contract tests** sobre `shared::model`/`shared::proto` y los endpoints `/api/agent/*` para no romper compatibilidad Agent viejo ↔ Monitor nuevo (relevante desde que existan actualizaciones, sección 37) — `serde` con `#[serde(deny_unknown_fields)]` selectivo ayuda a detectar breaking changes de forma temprana.
-- Cobertura mínima no es objetivo en sí mismo; priorizar tests sobre: detección online/offline, evaluación de reglas de alerta, RBAC (denegar correctamente), y migraciones de esquema.
+- Cobertura mínima no es objetivo en sí mismo; priorizar tests sobre: detección online/offline, evaluación de reglas de alerta, autenticación (sesión/token inválido se rechaza), y migraciones de esquema.
 
 ## 5. Riesgos y decisiones pendientes de validar con uso real
 
