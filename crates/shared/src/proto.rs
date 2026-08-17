@@ -45,24 +45,27 @@ pub struct MetricsRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentEvent {
-    DockerContainerStateChanged {
-        container_id: String,
-        container_name: String,
-        from_state: String,
-        to_state: String,
-    },
-    DockerContainerRestarted {
-        container_id: String,
-        container_name: String,
-        restart_count: u32,
-    },
+pub struct DockerContainerReport {
+    pub container_id: String,
+    pub name: String,
+    pub image: String,
+    pub state: crate::ContainerState,
+    pub cpu_pct: f32,
+    pub mem_used: u64,
+    pub mem_limit: u64,
+    pub net_rx: u64,
+    pub net_tx: u64,
+    pub restart_count: u32,
+    pub started_at: Option<DateTime<Utc>>,
 }
 
+/// A full snapshot of every container on the Agent's host, sent each
+/// heartbeat cycle. Simpler and more robust than diff-tracking state
+/// changes client-side: the Monitor derives transitions (e.g. "container
+/// stopped") by comparing this snapshot to what it already has stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventsRequest {
+pub struct DockerReportRequest {
     pub server_id: Uuid,
     pub ts: DateTime<Utc>,
-    pub events: Vec<AgentEvent>,
+    pub containers: Vec<DockerContainerReport>,
 }
