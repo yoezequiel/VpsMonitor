@@ -1,3 +1,8 @@
+//! Persisted node configuration (`~/.config/vpsmonitor/config.toml`),
+//! shared by the CLI (`monitor-bin`) and the desktop app (`desktop`) so
+//! both can start the same embedded Monitor/Agent from the same on-disk
+//! state instead of duplicating this shape.
+
 use std::path::PathBuf;
 
 use directories::ProjectDirs;
@@ -19,6 +24,13 @@ pub struct MonitorConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub heartbeat_timeout_s: u64,
+    /// How long raw metric samples are kept before being rolled up into
+    /// hourly averages (see `monitor_core::scheduler::run_metrics_rollup`).
+    #[serde(default = "default_raw_retention_hours")]
+    pub metrics_raw_retention_hours: u64,
+    /// How long hourly rollups are kept before being pruned entirely.
+    #[serde(default = "default_rollup_retention_days")]
+    pub metrics_rollup_retention_days: u64,
     /// Set only in Monitor+Agent mode: the id of the server row this same
     /// node registered for itself. `monitor run` uses it to drive
     /// self-monitoring straight into the store (see PLAN.md section 5).
@@ -27,6 +39,14 @@ pub struct MonitorConfig {
     /// alongside the API. `None` when no build was found at install time —
     /// the Monitor still runs API-only.
     pub static_dir: Option<PathBuf>,
+}
+
+fn default_raw_retention_hours() -> u64 {
+    24
+}
+
+fn default_rollup_retention_days() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

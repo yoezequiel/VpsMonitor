@@ -12,19 +12,13 @@ path = "src/main.rs"
 cli.workspace = true
 shared.workspace = true
 monitor-core.workspace = true
+config.workspace = true
 agent-core = { path = "../agent-core" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
-serde.workspace = true
-toml.workspace = true
-directories.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-rand.workspace = true
 anyhow.workspace = true
-axum-server.workspace = true
-reqwest.workspace = true
-tower-http.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }

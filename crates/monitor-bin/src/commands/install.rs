@@ -5,10 +5,10 @@ use chrono::Utc;
 use cli::InstallMode;
 use monitor_core::store::SqliteStore;
 use monitor_core::{auth, tls, Store};
-use shared::{Role, Server, ServerStatus, User};
+use shared::{Server, ServerStatus, User};
 use uuid::Uuid;
 
-use crate::config::{self, AgentConfig, Config, Mode, MonitorConfig};
+use config::{self, AgentConfig, Config, Mode, MonitorConfig};
 
 fn prompt(label: &str, default: Option<&str>) -> anyhow::Result<String> {
     let suffix = default.map(|d| format!(" [{d}]")).unwrap_or_default();
@@ -121,7 +121,6 @@ async fn install_monitor(
             id: Uuid::new_v4(),
             username: username.clone(),
             password_hash: auth::hash_password(&password)?,
-            role: Role::Administrator,
             created_at: Utc::now(),
         })
         .await?;
@@ -142,6 +141,8 @@ async fn install_monitor(
         cert_path,
         key_path,
         heartbeat_timeout_s: 60,
+        metrics_raw_retention_hours: 24,
+        metrics_rollup_retention_days: 30,
         self_server_id: None,
         static_dir: find_dashboard_build(),
     })

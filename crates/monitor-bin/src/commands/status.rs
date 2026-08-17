@@ -1,8 +1,8 @@
 use monitor_core::store::SqliteStore;
-use monitor_core::Store;
+use monitor_core::{tls, Store};
 use shared::ServerStatus;
 
-use crate::config::Config;
+use config::Config;
 
 pub async fn run() -> anyhow::Result<()> {
     let Some(config) = Config::load().await? else {
@@ -19,12 +19,10 @@ pub async fn run() -> anyhow::Result<()> {
             .iter()
             .filter(|s| s.status == ServerStatus::Online)
             .count();
-        println!(
-            "Monitor: {} server(s), {} online — listening on {}",
-            servers.len(),
-            online,
-            monitor_cfg.bind_addr
-        );
+        println!("Monitor: {} server(s), {} online", servers.len(), online);
+        let port = monitor_cfg.bind_addr.rsplit(':').next().unwrap_or("8443");
+        let host = tls::primary_local_ip().unwrap_or_else(|| "localhost".to_string());
+        println!("  dashboard: https://{host}:{port}");
         println!("  db: {}", monitor_cfg.db_path.display());
     }
 

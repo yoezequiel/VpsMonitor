@@ -7,6 +7,8 @@ members = [
     "crates/agent-core",
     "crates/shared",
     "crates/cli",
+    "crates/config",
+    "desktop/src-tauri",
 ]
 
 [workspace.package]
@@ -38,6 +40,7 @@ rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
 rcgen = "0.13"
+if-addrs = "0.13"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 directories = "5"
 toml = "0.8"
@@ -46,3 +49,4 @@ shared = { path = "crates/shared" }
 monitor-core = { path = "crates/monitor-core" }
 agent-core = { path = "crates/agent-core" }
 cli = { path = "crates/cli" }
+config = { path = "crates/config" }

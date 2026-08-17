@@ -1,18 +1,10 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use agent_core::collector::Collector;
 use agent_core::reporter::Reporter;
-use axum_server::tls_rustls::RustlsConfig;
-use monitor_core::state::ServerStatusEvent;
-use monitor_core::store::SqliteStore;
-use monitor_core::{api, scheduler, AppState};
-use shared::ServerStatus;
-use tower_http::services::{ServeDir, ServeFile};
-use uuid::Uuid;
+use monitor_core::server::{ServerParams, Transport};
 
-use crate::config::{AgentConfig, Config, Mode, MonitorConfig};
+use config::{AgentConfig, Config, Mode, MonitorConfig};
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     match config.mode {
@@ -38,60 +30,36 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
 async fn run_monitor(
     monitor_cfg: MonitorConfig,
-    self_server_id: Option<Uuid>,
+    self_server_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<()> {
-    let store = SqliteStore::connect(&monitor_cfg.db_path.to_string_lossy()).await?;
-    let state = AppState::new(Arc::new(store));
-
-    scheduler::spawn_offline_detector(
-        state.clone(),
-        Duration::from_secs(monitor_cfg.heartbeat_timeout_s),
-        Duration::from_secs(10),
+    let bind_addr = monitor_cfg.bind_addr.parse()?;
+    let port = bind_addr_port(&monitor_cfg.bind_addr);
+    let host = monitor_core::tls::primary_local_ip().unwrap_or_else(|| "localhost".to_string());
+    tracing::info!(
+        dashboard = format!("https://{host}:{port}"),
+        "reachable from your network"
     );
 
-    if let Some(server_id) = self_server_id {
-        tokio::spawn(self_monitor_loop(state.clone(), server_id));
-    }
-
-    let tls_config =
-        RustlsConfig::from_pem_file(&monitor_cfg.cert_path, &monitor_cfg.key_path).await?;
-    let addr: SocketAddr = monitor_cfg.bind_addr.parse()?;
-    tracing::info!(%addr, "Monitor listening (HTTPS)");
-
-    let mut router = api::router(state);
-    if let Some(static_dir) = &monitor_cfg.static_dir {
-        tracing::info!(dir = %static_dir.display(), "serving dashboard");
-        let serve_dir =
-            ServeDir::new(static_dir).fallback(ServeFile::new(static_dir.join("index.html")));
-        router = router.fallback_service(serve_dir);
-    }
-    axum_server::bind_rustls(addr, tls_config)
-        .serve(router.into_make_service())
-        .await?;
-    Ok(())
+    monitor_core::server::run(ServerParams {
+        bind_addr,
+        db_path: monitor_cfg.db_path,
+        transport: Transport::Tls {
+            cert_path: monitor_cfg.cert_path,
+            key_path: monitor_cfg.key_path,
+        },
+        static_dir: monitor_cfg.static_dir,
+        heartbeat_timeout: Duration::from_secs(monitor_cfg.heartbeat_timeout_s),
+        raw_metrics_retention: Duration::from_secs(monitor_cfg.metrics_raw_retention_hours * 3600),
+        rollup_metrics_retention: Duration::from_secs(
+            monitor_cfg.metrics_rollup_retention_days * 86400,
+        ),
+        self_server_id,
+    })
+    .await
 }
 
-/// Drives self-monitoring straight into the store instead of looping the
-/// Agent's HTTP client back to this same process (see install.rs).
-async fn self_monitor_loop(state: AppState, server_id: Uuid) {
-    let mut collector = Collector::new();
-    let mut ticker = tokio::time::interval(Duration::from_secs(15));
-    loop {
-        ticker.tick().await;
-        let metric = collector.snapshot(server_id);
-
-        if let Err(err) = state.store.update_heartbeat(server_id, metric.ts).await {
-            tracing::warn!(%err, "self-monitor: heartbeat update failed");
-            continue;
-        }
-        let _ = state.status_tx.send(ServerStatusEvent {
-            server_id,
-            status: ServerStatus::Online,
-        });
-        if let Err(err) = state.store.insert_metric(&metric).await {
-            tracing::warn!(%err, "self-monitor: metric insert failed");
-        }
-    }
+fn bind_addr_port(bind_addr: &str) -> &str {
+    bind_addr.rsplit(':').next().unwrap_or("8443")
 }
 
 async fn run_agent(agent_cfg: AgentConfig) -> anyhow::Result<()> {

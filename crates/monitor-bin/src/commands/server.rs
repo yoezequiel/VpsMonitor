@@ -1,7 +1,7 @@
 use monitor_core::store::SqliteStore;
-use monitor_core::{api, Store};
+use monitor_core::{api, tls, Store};
 
-use crate::config::{Config, MonitorConfig};
+use config::{Config, MonitorConfig};
 
 async fn require_monitor() -> anyhow::Result<MonitorConfig> {
     let config = Config::load()
@@ -40,16 +40,12 @@ pub async fn add(name: String) -> anyhow::Result<()> {
     let store = SqliteStore::connect(&monitor_cfg.db_path.to_string_lossy()).await?;
     let token = api::create_pairing_token(&store, &name).await?;
 
+    let port = monitor_cfg.bind_addr.rsplit(':').next().unwrap_or("8443");
+    let host = tls::primary_local_ip().unwrap_or_else(|| "<this-host-ip>".to_string());
+
     println!("Pairing token generated for '{name}' (valid 15 minutes):\n");
     println!("  {token}\n");
     println!("On the target machine, run:");
-    println!(
-        "  monitor install --mode agent --monitor-url https://<this-host>:{} --pairing-token {token}",
-        monitor_cfg
-            .bind_addr
-            .rsplit(':')
-            .next()
-            .unwrap_or("8443")
-    );
+    println!("  monitor install --mode agent --monitor-url https://{host}:{port} --pairing-token {token}");
     Ok(())
 }

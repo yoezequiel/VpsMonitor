@@ -1,5 +1,4 @@
 mod commands;
-mod config;
 
 use clap::Parser;
 use cli::{AgentCommand, Cli, Command, IncidentCommand, ServerCommand};

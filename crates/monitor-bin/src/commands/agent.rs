@@ -1,7 +1,7 @@
 use monitor_core::store::SqliteStore;
 use monitor_core::Store;
 
-use crate::config::Config;
+use config::Config;
 
 pub async fn status() -> anyhow::Result<()> {
     let Some(config) = Config::load().await? else {

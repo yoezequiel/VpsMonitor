@@ -9,3 +9,4 @@
 node_modules/
 web/dist/
 desktop/target/
+desktop/src-tauri/gen/
