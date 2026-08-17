@@ -1,5 +1,7 @@
 use chrono::Utc;
-use shared::proto::{HeartbeatRequest, MetricsRequest, RegisterRequest, RegisterResponse};
+use shared::proto::{
+    DockerReportRequest, HeartbeatRequest, MetricsRequest, RegisterRequest, RegisterResponse,
+};
 use uuid::Uuid;
 
 /// Talks to a single Monitor over HTTPS. Holds the permanent agent token
@@ -95,6 +97,19 @@ impl Reporter {
         self.authed_post("/api/agent/metrics", &req).await
     }
 
+    pub async fn send_docker_report(
+        &self,
+        server_id: Uuid,
+        containers: Vec<shared::proto::DockerContainerReport>,
+    ) -> anyhow::Result<()> {
+        let req = DockerReportRequest {
+            server_id,
+            ts: Utc::now(),
+            containers,
+        };
+        self.authed_post("/api/agent/docker", &req).await
+    }
+
     async fn authed_post<T: serde::Serialize>(&self, path: &str, body: &T) -> anyhow::Result<()> {
         let token = self
             .agent_token
@@ -111,16 +126,21 @@ impl Reporter {
     }
 }
 
-/// Runs the heartbeat + metrics reporting loop forever, at `interval`.
-/// Errors are logged and swallowed — a single failed request must not kill
-/// the Agent process, since the Monitor may just be temporarily
-/// unreachable.
+/// Runs the heartbeat + metrics (+ Docker, when available) reporting loop
+/// forever, at `interval`. Errors are logged and swallowed — a single
+/// failed request must not kill the Agent process, since the Monitor may
+/// just be temporarily unreachable.
 pub async fn run_loop(
     reporter: &Reporter,
     collector: &mut super::collector::Collector,
     server_id: Uuid,
     interval: std::time::Duration,
 ) {
+    let docker = super::docker::DockerCollector::new();
+    if docker.available() {
+        tracing::info!("Docker detected — container monitoring enabled");
+    }
+
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
@@ -133,6 +153,13 @@ pub async fn run_loop(
         let metric = collector.snapshot(server_id);
         if let Err(err) = reporter.send_metrics(&metric).await {
             tracing::warn!(%err, "metrics report failed");
+        }
+
+        if docker.available() {
+            let containers = docker.collect().await;
+            if let Err(err) = reporter.send_docker_report(server_id, containers).await {
+                tracing::warn!(%err, "docker report failed");
+            }
         }
     }
 }
