@@ -87,3 +87,44 @@ pub fn host_info() -> HostInfo {
         arch: System::cpu_arch(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Smoke tests only: real values depend on the machine running the
+    // test, so we assert plausibility (non-negative, disk used <= total)
+    // rather than exact numbers.
+    #[test]
+    fn snapshot_returns_plausible_values() {
+        let mut collector = Collector::new();
+        let server_id = Uuid::new_v4();
+        let metric = collector.snapshot(server_id);
+
+        assert_eq!(metric.server_id, server_id);
+        assert!(metric.cpu_pct >= 0.0);
+        assert!(metric.mem_total > 0, "a test machine always has some RAM");
+        assert!(
+            metric.mem_used <= metric.mem_total * 2,
+            "sanity bound, not exact: swap accounting varies by OS"
+        );
+        assert!(metric.disk_used <= metric.disk_total);
+        assert!(metric.load1 >= 0.0);
+    }
+
+    #[test]
+    fn snapshot_ids_are_unique_across_calls() {
+        let mut collector = Collector::new();
+        let server_id = Uuid::new_v4();
+        let a = collector.snapshot(server_id);
+        let b = collector.snapshot(server_id);
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn host_info_never_panics_and_reports_non_empty_fields() {
+        let info = host_info();
+        assert!(!info.hostname.is_empty());
+        assert!(!info.arch.is_empty());
+    }
+}
