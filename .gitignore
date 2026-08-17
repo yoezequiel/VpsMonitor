@@ -1,0 +1,11 @@
+/target
+**/target
+.DS_Store
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+.env
+node_modules/
+web/dist/
+desktop/target/

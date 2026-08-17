@@ -1,0 +1,15 @@
+[package]
+name = "agent-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vpsmonitor-agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
