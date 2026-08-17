@@ -1,6 +1,6 @@
-//! Tokens, sessions and password hashing. Full RBAC enforcement lands in
-//! V3 (see `Proyecto.md` section 28); the MVP has a single implicit
-//! Administrator role.
+//! Tokens, sessions and password hashing. Deliberately no RBAC: any
+//! authenticated user has full access — a flat permission model by
+//! product decision, not an MVP shortcut.
 
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};

@@ -6,7 +6,7 @@ pub use sqlite::SqliteStore;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use shared::{Metric, Server, User};
+use shared::{HealthCheck, HealthCheckResult, Metric, Server, User};
 use uuid::Uuid;
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -16,10 +16,8 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// support (V4) is expected to implement this same trait so the rest of the
 /// codebase stays backend-agnostic.
 ///
-/// Scope is intentionally limited to what the MVP needs (servers, metrics,
-/// users). Health checks, alerts and incidents get their own trait methods
-/// once those features land in V2 — adding them here now would be
-/// speculative.
+/// Alerts and incidents get their own trait methods once those V2 features
+/// land — adding them here now would be speculative.
 #[async_trait]
 pub trait Store: Send + Sync {
     // -- servers ---------------------------------------------------------
@@ -47,6 +45,30 @@ pub trait Store: Send + Sync {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> StoreResult<Vec<Metric>>;
+
+    /// Hourly-averaged metrics for a range, read from `metric_rollups`
+    /// rather than raw samples. Returned as `Metric` (averages standing in
+    /// for point values) so API/frontend consumers don't need a second
+    /// shape — see `Store::rollup_and_prune`.
+    async fn list_metric_rollups(
+        &self,
+        server_id: Uuid,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> StoreResult<Vec<Metric>>;
+
+    /// Maintenance pass: aggregates every raw metric older than
+    /// `raw_cutoff` into hourly buckets in `metric_rollups`, deletes those
+    /// raw rows, then deletes rollup buckets older than `rollup_cutoff`.
+    /// Returns `(buckets_rolled_up, raw_rows_deleted, rollups_pruned)` for
+    /// logging. Keeps the raw `metrics` table bounded regardless of how
+    /// long a server has been monitored (PLAN.md section 2.3 / risk on
+    /// `metrics` volume).
+    async fn rollup_and_prune(
+        &self,
+        raw_cutoff: DateTime<Utc>,
+        rollup_cutoff: DateTime<Utc>,
+    ) -> StoreResult<(u64, u64, u64)>;
 
     // -- users ---------------------------------------------------------------
     async fn create_user(&self, user: &User) -> StoreResult<()>;
@@ -82,4 +104,25 @@ pub trait Store: Send + Sync {
     async fn get_user_by_session_token_hash(&self, token_hash: &str) -> StoreResult<Option<User>>;
 
     async fn delete_session(&self, token_hash: &str) -> StoreResult<()>;
+
+    // -- health checks -------------------------------------------------------
+    async fn create_health_check(&self, check: &HealthCheck) -> StoreResult<()>;
+    async fn list_health_checks(&self) -> StoreResult<Vec<HealthCheck>>;
+    async fn delete_health_check(&self, id: Uuid) -> StoreResult<()>;
+
+    async fn insert_health_check_result(&self, result: &HealthCheckResult) -> StoreResult<()>;
+    async fn list_health_check_results(
+        &self,
+        health_check_id: Uuid,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> StoreResult<Vec<HealthCheckResult>>;
+
+    /// Timestamp of the most recent result for this check, or `None` if it
+    /// has never run — used by the scheduler to decide whether a check is
+    /// due without keeping separate "last run" bookkeeping.
+    async fn last_health_check_result_at(
+        &self,
+        health_check_id: Uuid,
+    ) -> StoreResult<Option<DateTime<Utc>>>;
 }

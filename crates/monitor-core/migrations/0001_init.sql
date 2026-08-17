@@ -31,11 +31,12 @@ CREATE TABLE metrics (
 );
 CREATE INDEX idx_metrics_server_ts ON metrics(server_id, ts);
 
+-- Flat permission model: any authenticated user has full access, so
+-- there is no role/permission column here by design.
 CREATE TABLE users (
     id              TEXT PRIMARY KEY,
     username        TEXT NOT NULL UNIQUE,
     password_hash   TEXT NOT NULL,
-    role            TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
 

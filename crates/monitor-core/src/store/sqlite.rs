@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use shared::{Role, Server, ServerStatus, User};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use shared::{HealthCheck, HealthCheckResult, HealthCheckType, Server, ServerStatus, User};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -15,10 +17,20 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Connects to (and creates if missing) a SQLite database file, then
     /// applies pending migrations.
+    ///
+    /// WAL mode + a busy timeout matter here specifically because a single
+    /// Monitor+Agent process already has several tasks writing to the same
+    /// file concurrently (heartbeat/metrics ingestion, the offline
+    /// detector, the metrics-rollup job, self-monitoring) — SQLite's
+    /// default rollback-journal mode serializes writers hard enough that
+    /// "database is locked" shows up under completely ordinary load, not
+    /// just under contention from a second process.
     pub async fn connect(path: &str) -> anyhow::Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(10));
         let pool = SqlitePoolOptions::new().connect_with(options).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
@@ -50,20 +62,52 @@ fn status_str(s: ServerStatus) -> &'static str {
     }
 }
 
-fn parse_role(s: &str) -> Role {
+fn parse_health_check_type(s: &str) -> HealthCheckType {
     match s {
-        "administrator" => Role::Administrator,
-        "operator" => Role::Operator,
-        _ => Role::Viewer,
+        "https" => HealthCheckType::Https,
+        "tcp" => HealthCheckType::Tcp,
+        "ping" => HealthCheckType::Ping,
+        "dns" => HealthCheckType::Dns,
+        _ => HealthCheckType::Http,
     }
 }
 
-fn role_str(r: Role) -> &'static str {
-    match r {
-        Role::Administrator => "administrator",
-        Role::Operator => "operator",
-        Role::Viewer => "viewer",
+fn health_check_type_str(t: HealthCheckType) -> &'static str {
+    match t {
+        HealthCheckType::Http => "http",
+        HealthCheckType::Https => "https",
+        HealthCheckType::Tcp => "tcp",
+        HealthCheckType::Ping => "ping",
+        HealthCheckType::Dns => "dns",
     }
+}
+
+fn row_to_health_check(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<HealthCheck> {
+    let server_id: Option<String> = row.try_get("server_id")?;
+    let expected_status: Option<i64> = row.try_get("expected_status")?;
+    Ok(HealthCheck {
+        id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+        name: row.try_get("name")?,
+        kind: parse_health_check_type(row.try_get::<String, _>("kind")?.as_str()),
+        target: row.try_get("target")?,
+        interval_s: row.try_get::<i64, _>("interval_s")? as u32,
+        timeout_s: row.try_get::<i64, _>("timeout_s")? as u32,
+        expected_status: expected_status.map(|s| s as u16),
+        server_id: server_id.map(|s| Uuid::parse_str(&s)).transpose()?,
+    })
+}
+
+fn row_to_health_check_result(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<HealthCheckResult> {
+    let status_code: Option<i64> = row.try_get("status_code")?;
+    Ok(HealthCheckResult {
+        id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+        health_check_id: Uuid::parse_str(row.try_get::<String, _>("health_check_id")?.as_str())?,
+        ts: DateTime::parse_from_rfc3339(row.try_get::<String, _>("ts")?.as_str())?
+            .with_timezone(&Utc),
+        status_code: status_code.map(|s| s as u16),
+        latency_ms: row.try_get::<i64, _>("latency_ms")? as u32,
+        ok: row.try_get("ok")?,
+    })
 }
 
 fn row_to_server(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Server> {
@@ -256,14 +300,188 @@ impl Store for SqliteStore {
             .map_err(StoreError::Backend)
     }
 
+    async fn list_metric_rollups(
+        &self,
+        server_id: Uuid,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> StoreResult<Vec<shared::Metric>> {
+        let rows = sqlx::query(
+            "SELECT * FROM metric_rollups WHERE server_id = ? AND bucket_start BETWEEN ? AND ? ORDER BY bucket_start",
+        )
+        .bind(server_id.to_string())
+        .bind(since.to_rfc3339())
+        .bind(until.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+
+        rows.iter()
+            .map(|row| {
+                Ok(shared::Metric {
+                    id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+                    server_id: Uuid::parse_str(row.try_get::<String, _>("server_id")?.as_str())?,
+                    ts: DateTime::parse_from_rfc3339(
+                        row.try_get::<String, _>("bucket_start")?.as_str(),
+                    )?
+                    .with_timezone(&Utc),
+                    cpu_pct: row.try_get("avg_cpu_pct")?,
+                    mem_used: row.try_get::<i64, _>("avg_mem_used")? as u64,
+                    mem_total: row.try_get::<i64, _>("avg_mem_total")? as u64,
+                    disk_used: row.try_get::<i64, _>("avg_disk_used")? as u64,
+                    disk_total: row.try_get::<i64, _>("avg_disk_total")? as u64,
+                    load1: row.try_get("avg_load1")?,
+                    load5: row.try_get("avg_load5")?,
+                    load15: row.try_get("avg_load15")?,
+                    net_rx: row.try_get::<i64, _>("avg_net_rx")? as u64,
+                    net_tx: row.try_get::<i64, _>("avg_net_tx")? as u64,
+                    uptime_s: row.try_get::<i64, _>("avg_uptime_s")? as u64,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(StoreError::Backend)
+    }
+
+    async fn rollup_and_prune(
+        &self,
+        raw_cutoff: DateTime<Utc>,
+        rollup_cutoff: DateTime<Utc>,
+    ) -> StoreResult<(u64, u64, u64)> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+
+        let buckets = sqlx::query(
+            "SELECT server_id, strftime('%Y-%m-%dT%H:00:00Z', ts) AS bucket,
+                    AVG(cpu_pct) AS avg_cpu_pct,
+                    AVG(mem_used) AS avg_mem_used, AVG(mem_total) AS avg_mem_total,
+                    AVG(disk_used) AS avg_disk_used, AVG(disk_total) AS avg_disk_total,
+                    AVG(load1) AS avg_load1, AVG(load5) AS avg_load5, AVG(load15) AS avg_load15,
+                    AVG(net_rx) AS avg_net_rx, AVG(net_tx) AS avg_net_tx,
+                    AVG(uptime_s) AS avg_uptime_s, COUNT(*) AS sample_count
+             FROM metrics
+             WHERE ts < ?
+             GROUP BY server_id, bucket",
+        )
+        .bind(raw_cutoff.to_rfc3339())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+
+        let rolled_up = buckets.len() as u64;
+        for row in &buckets {
+            sqlx::query(
+                "INSERT INTO metric_rollups
+                    (id, server_id, bucket_start, avg_cpu_pct, avg_mem_used, avg_mem_total,
+                     avg_disk_used, avg_disk_total, avg_load1, avg_load5, avg_load15,
+                     avg_net_rx, avg_net_tx, avg_uptime_s, sample_count)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(server_id, bucket_start) DO UPDATE SET
+                    avg_cpu_pct = excluded.avg_cpu_pct,
+                    avg_mem_used = excluded.avg_mem_used,
+                    avg_mem_total = excluded.avg_mem_total,
+                    avg_disk_used = excluded.avg_disk_used,
+                    avg_disk_total = excluded.avg_disk_total,
+                    avg_load1 = excluded.avg_load1,
+                    avg_load5 = excluded.avg_load5,
+                    avg_load15 = excluded.avg_load15,
+                    avg_net_rx = excluded.avg_net_rx,
+                    avg_net_tx = excluded.avg_net_tx,
+                    avg_uptime_s = excluded.avg_uptime_s,
+                    sample_count = excluded.sample_count",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(
+                row.try_get::<String, _>("server_id")
+                    .map_err(|e| StoreError::Backend(e.into()))?,
+            )
+            .bind(
+                row.try_get::<String, _>("bucket")
+                    .map_err(|e| StoreError::Backend(e.into()))?,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_cpu_pct")
+                    .map_err(|e| StoreError::Backend(e.into()))?,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_mem_used")
+                    .map_err(|e| StoreError::Backend(e.into()))? as i64,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_mem_total")
+                    .map_err(|e| StoreError::Backend(e.into()))? as i64,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_disk_used")
+                    .map_err(|e| StoreError::Backend(e.into()))? as i64,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_disk_total")
+                    .map_err(|e| StoreError::Backend(e.into()))? as i64,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_load1")
+                    .map_err(|e| StoreError::Backend(e.into()))?,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_load5")
+                    .map_err(|e| StoreError::Backend(e.into()))?,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_load15")
+                    .map_err(|e| StoreError::Backend(e.into()))?,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_net_rx")
+                    .map_err(|e| StoreError::Backend(e.into()))? as i64,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_net_tx")
+                    .map_err(|e| StoreError::Backend(e.into()))? as i64,
+            )
+            .bind(
+                row.try_get::<f64, _>("avg_uptime_s")
+                    .map_err(|e| StoreError::Backend(e.into()))? as i64,
+            )
+            .bind(
+                row.try_get::<i64, _>("sample_count")
+                    .map_err(|e| StoreError::Backend(e.into()))?,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        }
+
+        let deleted = sqlx::query("DELETE FROM metrics WHERE ts < ?")
+            .bind(raw_cutoff.to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?
+            .rows_affected();
+
+        let pruned = sqlx::query("DELETE FROM metric_rollups WHERE bucket_start < ?")
+            .bind(rollup_cutoff.to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?
+            .rows_affected();
+
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+
+        Ok((rolled_up, deleted, pruned))
+    }
+
     async fn create_user(&self, user: &User) -> StoreResult<()> {
         sqlx::query(
-            "INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
         )
         .bind(user.id.to_string())
         .bind(&user.username)
         .bind(&user.password_hash)
-        .bind(role_str(user.role))
         .bind(user.created_at.to_rfc3339())
         .execute(&self.pool)
         .await
@@ -291,11 +509,6 @@ impl Store for SqliteStore {
             password_hash: row
                 .try_get("password_hash")
                 .map_err(|e| StoreError::Backend(e.into()))?,
-            role: parse_role(
-                row.try_get::<String, _>("role")
-                    .map_err(|e| StoreError::Backend(e.into()))?
-                    .as_str(),
-            ),
             created_at: DateTime::parse_from_rfc3339(
                 row.try_get::<String, _>("created_at")
                     .map_err(|e| StoreError::Backend(e.into()))?
@@ -419,11 +632,6 @@ impl Store for SqliteStore {
             password_hash: row
                 .try_get("password_hash")
                 .map_err(|e| StoreError::Backend(e.into()))?,
-            role: parse_role(
-                row.try_get::<String, _>("role")
-                    .map_err(|e| StoreError::Backend(e.into()))?
-                    .as_str(),
-            ),
             created_at: DateTime::parse_from_rfc3339(
                 row.try_get::<String, _>("created_at")
                     .map_err(|e| StoreError::Backend(e.into()))?
@@ -441,6 +649,107 @@ impl Store for SqliteStore {
             .await
             .map_err(|e| StoreError::Backend(e.into()))?;
         Ok(())
+    }
+
+    async fn create_health_check(&self, check: &shared::HealthCheck) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO health_checks (id, name, kind, target, interval_s, timeout_s, expected_status, server_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(check.id.to_string())
+        .bind(&check.name)
+        .bind(health_check_type_str(check.kind))
+        .bind(&check.target)
+        .bind(check.interval_s as i64)
+        .bind(check.timeout_s as i64)
+        .bind(check.expected_status.map(|s| s as i64))
+        .bind(check.server_id.map(|id| id.to_string()))
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_health_checks(&self) -> StoreResult<Vec<shared::HealthCheck>> {
+        let rows = sqlx::query("SELECT * FROM health_checks ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|row| row_to_health_check(row).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn delete_health_check(&self, id: Uuid) -> StoreResult<()> {
+        sqlx::query("DELETE FROM health_checks WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn insert_health_check_result(
+        &self,
+        result: &shared::HealthCheckResult,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO health_check_results (id, health_check_id, ts, status_code, latency_ms, ok)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(result.id.to_string())
+        .bind(result.health_check_id.to_string())
+        .bind(result.ts.to_rfc3339())
+        .bind(result.status_code.map(|s| s as i64))
+        .bind(result.latency_ms as i64)
+        .bind(result.ok)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_health_check_results(
+        &self,
+        health_check_id: Uuid,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> StoreResult<Vec<shared::HealthCheckResult>> {
+        let rows = sqlx::query(
+            "SELECT * FROM health_check_results WHERE health_check_id = ? AND ts BETWEEN ? AND ? ORDER BY ts",
+        )
+        .bind(health_check_id.to_string())
+        .bind(since.to_rfc3339())
+        .bind(until.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+
+        rows.iter()
+            .map(|row| row_to_health_check_result(row).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn last_health_check_result_at(
+        &self,
+        health_check_id: Uuid,
+    ) -> StoreResult<Option<DateTime<Utc>>> {
+        let row = sqlx::query(
+            "SELECT ts FROM health_check_results WHERE health_check_id = ? ORDER BY ts DESC LIMIT 1",
+        )
+        .bind(health_check_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+
+        row.map(|r| {
+            DateTime::parse_from_rfc3339(r.try_get::<String, _>("ts")?.as_str())
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(anyhow::Error::from)
+        })
+        .transpose()
+        .map_err(StoreError::Backend)
     }
 }
 
@@ -613,6 +922,155 @@ mod tests {
         assert!(out_of_range.is_empty());
     }
 
+    fn metric_at(server_id: Uuid, ts: DateTime<Utc>, cpu_pct: f32) -> shared::Metric {
+        shared::Metric {
+            id: Uuid::new_v4(),
+            server_id,
+            ts,
+            cpu_pct,
+            mem_used: 100,
+            mem_total: 200,
+            disk_used: 10,
+            disk_total: 100,
+            load1: 0.1,
+            load5: 0.2,
+            load15: 0.3,
+            net_rx: 10,
+            net_tx: 20,
+            uptime_s: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn rollup_and_prune_averages_old_metrics_and_deletes_raw() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-rollup").await.unwrap();
+
+        // Two samples two days ago, in the same hour bucket.
+        let bucket_hour = (Utc::now() - chrono::Duration::days(2))
+            .date_naive()
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .and_utc();
+        store
+            .insert_metric(&metric_at(
+                server.id,
+                bucket_hour + chrono::Duration::minutes(5),
+                20.0,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_metric(&metric_at(
+                server.id,
+                bucket_hour + chrono::Duration::minutes(35),
+                40.0,
+            ))
+            .await
+            .unwrap();
+        // One recent sample that must survive the rollup untouched.
+        store
+            .insert_metric(&metric_at(server.id, Utc::now(), 99.0))
+            .await
+            .unwrap();
+
+        let raw_cutoff = Utc::now() - chrono::Duration::hours(24);
+        let (rolled_up, raw_deleted, pruned) = store
+            .rollup_and_prune(raw_cutoff, Utc::now() - chrono::Duration::days(365))
+            .await
+            .unwrap();
+        assert_eq!(rolled_up, 1);
+        assert_eq!(raw_deleted, 2);
+        assert_eq!(pruned, 0);
+
+        let old_raw = store
+            .list_metrics(
+                server.id,
+                bucket_hour - chrono::Duration::hours(1),
+                bucket_hour + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert!(
+            old_raw.is_empty(),
+            "raw rows older than the cutoff must be deleted"
+        );
+
+        let rollups = store
+            .list_metric_rollups(
+                server.id,
+                bucket_hour - chrono::Duration::hours(1),
+                bucket_hour + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].cpu_pct, 30.0); // average of 20.0 and 40.0
+
+        let recent = store
+            .list_metrics(
+                server.id,
+                Utc::now() - chrono::Duration::minutes(1),
+                Utc::now() + chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 1, "recent sample must not be rolled up yet");
+    }
+
+    #[tokio::test]
+    async fn rollup_and_prune_removes_stale_rollups() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-prune").await.unwrap();
+
+        let ancient = Utc::now() - chrono::Duration::days(40);
+        store
+            .insert_metric(&metric_at(server.id, ancient, 50.0))
+            .await
+            .unwrap();
+
+        // First pass rolls the ancient sample up.
+        store
+            .rollup_and_prune(
+                Utc::now() - chrono::Duration::hours(24),
+                Utc::now() - chrono::Duration::days(365),
+            )
+            .await
+            .unwrap();
+        let before_prune = store
+            .list_metric_rollups(
+                server.id,
+                ancient - chrono::Duration::hours(1),
+                ancient + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before_prune.len(), 1);
+
+        // Second pass prunes rollups older than 30 days.
+        let (rolled_up, _, pruned) = store
+            .rollup_and_prune(
+                Utc::now() - chrono::Duration::hours(24),
+                Utc::now() - chrono::Duration::days(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rolled_up, 0);
+        assert_eq!(pruned, 1);
+
+        let after_prune = store
+            .list_metric_rollups(
+                server.id,
+                ancient - chrono::Duration::hours(1),
+                ancient + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert!(after_prune.is_empty());
+    }
+
     #[tokio::test]
     async fn pairing_token_is_single_use() {
         let store = SqliteStore::in_memory().await.unwrap();
@@ -655,13 +1113,75 @@ mod tests {
             id: Uuid::new_v4(),
             username: "admin".into(),
             password_hash: "hashed".into(),
-            role: Role::Administrator,
             created_at: Utc::now(),
         };
         store.create_user(&user).await.unwrap();
 
         let fetched = store.get_user_by_username("admin").await.unwrap().unwrap();
-        assert_eq!(fetched.role, Role::Administrator);
+        assert_eq!(fetched.username, "admin");
         assert_eq!(fetched.password_hash, "hashed");
+    }
+
+    #[tokio::test]
+    async fn health_check_crud_and_results() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let check = HealthCheck {
+            id: Uuid::new_v4(),
+            name: "api health".into(),
+            kind: HealthCheckType::Https,
+            target: "https://api.example.com/health".into(),
+            interval_s: 30,
+            timeout_s: 5,
+            expected_status: Some(200),
+            server_id: None,
+        };
+        store.create_health_check(&check).await.unwrap();
+
+        assert!(store
+            .last_health_check_result_at(check.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let checks = store.list_health_checks().await.unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "api health");
+        assert_eq!(checks[0].kind, HealthCheckType::Https);
+        assert_eq!(checks[0].expected_status, Some(200));
+
+        let now = Utc::now();
+        store
+            .insert_health_check_result(&HealthCheckResult {
+                id: Uuid::new_v4(),
+                health_check_id: check.id,
+                ts: now,
+                status_code: Some(200),
+                latency_ms: 42,
+                ok: true,
+            })
+            .await
+            .unwrap();
+
+        let last = store
+            .last_health_check_result_at(check.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!((last - now).num_seconds().abs() <= 1);
+
+        let results = store
+            .list_health_check_results(
+                check.id,
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok);
+        assert_eq!(results[0].status_code, Some(200));
+
+        store.delete_health_check(check.id).await.unwrap();
+        assert!(store.list_health_checks().await.unwrap().is_empty());
     }
 }

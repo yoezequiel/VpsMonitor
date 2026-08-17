@@ -1,11 +1,11 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::proto::{HeartbeatRequest, MetricsRequest, RegisterRequest, RegisterResponse};
-use shared::{Metric, Server, ServerStatus};
+use shared::{HealthCheck, HealthCheckResult, HealthCheckType, Metric, Server, ServerStatus};
 use uuid::Uuid;
 
 use crate::auth::{self, AuthAgent, AuthUser};
@@ -24,6 +24,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/servers", get(list_servers))
         .route("/api/servers/{id}", get(get_server))
         .route("/api/servers/{id}/metrics", get(list_metrics))
+        .route(
+            "/api/healthchecks",
+            get(list_health_checks).post(create_health_check),
+        )
+        .route("/api/healthchecks/{id}", delete(delete_health_check))
+        .route(
+            "/api/healthchecks/{id}/results",
+            get(list_health_check_results),
+        )
         .route("/api/ws", get(ws_handler))
         .with_state(state)
 }
@@ -191,6 +200,10 @@ struct MetricsRangeQuery {
     until: Option<DateTime<Utc>>,
 }
 
+/// Serves raw samples for the recent window and hourly rollups for
+/// anything older, transparently — see `Store::rollup_and_prune`. The
+/// response shape (`Vec<Metric>`) never changes, so the frontend doesn't
+/// need to know which source served a given point.
 async fn list_metrics(
     State(state): State<AppState>,
     AuthUser(_): AuthUser,
@@ -199,7 +212,102 @@ async fn list_metrics(
 ) -> Result<Json<Vec<Metric>>, ApiError> {
     let until = range.until.unwrap_or_else(Utc::now);
     let since = range.since.unwrap_or(until - chrono::Duration::hours(1));
-    Ok(Json(state.store.list_metrics(id, since, until).await?))
+    let raw_cutoff = Utc::now() - state.raw_metrics_retention;
+
+    let metrics = if since >= raw_cutoff {
+        state.store.list_metrics(id, since, until).await?
+    } else if until <= raw_cutoff {
+        state.store.list_metric_rollups(id, since, until).await?
+    } else {
+        let mut merged = state
+            .store
+            .list_metric_rollups(id, since, raw_cutoff)
+            .await?;
+        merged.extend(state.store.list_metrics(id, raw_cutoff, until).await?);
+        merged
+    };
+
+    Ok(Json(metrics))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateHealthCheckRequest {
+    name: String,
+    #[serde(rename = "type")]
+    kind: HealthCheckType,
+    target: String,
+    #[serde(default = "default_interval_s")]
+    interval_s: u32,
+    #[serde(default = "default_timeout_s")]
+    timeout_s: u32,
+    expected_status: Option<u16>,
+    server_id: Option<Uuid>,
+}
+
+fn default_interval_s() -> u32 {
+    30
+}
+
+fn default_timeout_s() -> u32 {
+    5
+}
+
+async fn create_health_check(
+    State(state): State<AppState>,
+    AuthUser(_): AuthUser,
+    Json(req): Json<CreateHealthCheckRequest>,
+) -> Result<Json<HealthCheck>, ApiError> {
+    if req.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("name must not be empty".into()));
+    }
+    if req.target.trim().is_empty() {
+        return Err(ApiError::BadRequest("target must not be empty".into()));
+    }
+
+    let check = HealthCheck {
+        id: Uuid::new_v4(),
+        name: req.name,
+        kind: req.kind,
+        target: req.target,
+        interval_s: req.interval_s.max(5),
+        timeout_s: req.timeout_s.max(1),
+        expected_status: req.expected_status,
+        server_id: req.server_id,
+    };
+    state.store.create_health_check(&check).await?;
+    Ok(Json(check))
+}
+
+async fn list_health_checks(
+    State(state): State<AppState>,
+    AuthUser(_): AuthUser,
+) -> Result<Json<Vec<HealthCheck>>, ApiError> {
+    Ok(Json(state.store.list_health_checks().await?))
+}
+
+async fn delete_health_check(
+    State(state): State<AppState>,
+    AuthUser(_): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    state.store.delete_health_check(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_health_check_results(
+    State(state): State<AppState>,
+    AuthUser(_): AuthUser,
+    Path(id): Path<Uuid>,
+    Query(range): Query<MetricsRangeQuery>,
+) -> Result<Json<Vec<HealthCheckResult>>, ApiError> {
+    let until = range.until.unwrap_or_else(Utc::now);
+    let since = range.since.unwrap_or(until - chrono::Duration::hours(24));
+    Ok(Json(
+        state
+            .store
+            .list_health_check_results(id, since, until)
+            .await?,
+    ))
 }
 
 /// Mints a one-time pairing token for a new server, valid for 15 minutes.
@@ -226,7 +334,7 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
-    use shared::{Role, User};
+    use shared::User;
     use tower::ServiceExt;
 
     use super::*;
@@ -239,7 +347,6 @@ mod tests {
                 id: Uuid::new_v4(),
                 username: "admin".into(),
                 password_hash: auth::hash_password("s3cret-password").unwrap(),
-                role: Role::Administrator,
                 created_at: Utc::now(),
             })
             .await
@@ -396,5 +503,101 @@ mod tests {
         let metrics = json_body(resp).await;
         assert_eq!(metrics.as_array().unwrap().len(), 1);
         assert_eq!(metrics[0]["cpu_pct"], 12.5);
+    }
+
+    #[tokio::test]
+    async fn health_check_routes_require_auth_and_round_trip() {
+        let state = test_state().await;
+        let app = router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/healthchecks",
+                None,
+                json!({ "name": "api", "type": "https", "target": "https://example.com/health" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/auth/login",
+                None,
+                json!({ "username": "admin", "password": "s3cret-password" }),
+            ))
+            .await
+            .unwrap();
+        let session_token = json_body(resp).await["token"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/healthchecks",
+                Some(&session_token),
+                json!({ "name": "api", "type": "https", "target": "https://example.com/health", "expected_status": 200 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created = json_body(resp).await;
+        let check_id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["interval_s"], 30); // default applied
+
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "GET",
+                "/api/healthchecks",
+                Some(&session_token),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let checks = json_body(resp).await;
+        assert_eq!(checks.as_array().unwrap().len(), 1);
+
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "GET",
+                &format!("/api/healthchecks/{check_id}/results"),
+                Some(&session_token),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await.as_array().unwrap().len(), 0);
+
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "DELETE",
+                &format!("/api/healthchecks/{check_id}"),
+                Some(&session_token),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "GET",
+                "/api/healthchecks",
+                Some(&session_token),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json_body(resp).await.as_array().unwrap().len(), 0);
     }
 }
