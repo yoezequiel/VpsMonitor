@@ -2,7 +2,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use shared::{HealthCheck, HealthCheckResult, HealthCheckType, Server, ServerStatus, User};
+use shared::{
+    AlertEvent, AlertRule, AlertSeverity, AlertState, ContainerState, DockerContainer, HealthCheck,
+    HealthCheckResult, HealthCheckType, Incident, IncidentEvent, IncidentStatus,
+    NotificationChannel, NotificationChannelKind, Server, ServerStatus, User,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
@@ -107,6 +111,152 @@ fn row_to_health_check_result(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<H
         status_code: status_code.map(|s| s as u16),
         latency_ms: row.try_get::<i64, _>("latency_ms")? as u32,
         ok: row.try_get("ok")?,
+    })
+}
+
+fn parse_container_state(s: &str) -> ContainerState {
+    match s {
+        "running" => ContainerState::Running,
+        "stopped" => ContainerState::Stopped,
+        "restarting" => ContainerState::Restarting,
+        "paused" => ContainerState::Paused,
+        _ => ContainerState::Unknown,
+    }
+}
+
+fn container_state_str(s: ContainerState) -> &'static str {
+    match s {
+        ContainerState::Running => "running",
+        ContainerState::Stopped => "stopped",
+        ContainerState::Restarting => "restarting",
+        ContainerState::Paused => "paused",
+        ContainerState::Unknown => "unknown",
+    }
+}
+
+fn row_to_docker_container(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<DockerContainer> {
+    let started_at: Option<String> = row.try_get("started_at")?;
+    Ok(DockerContainer {
+        server_id: Uuid::parse_str(row.try_get::<String, _>("server_id")?.as_str())?,
+        container_id: row.try_get("container_id")?,
+        name: row.try_get("name")?,
+        image: row.try_get("image")?,
+        state: parse_container_state(row.try_get::<String, _>("state")?.as_str()),
+        cpu_pct: row.try_get("cpu_pct")?,
+        mem_used: row.try_get::<i64, _>("mem_used")? as u64,
+        mem_limit: row.try_get::<i64, _>("mem_limit")? as u64,
+        net_rx: row.try_get::<i64, _>("net_rx")? as u64,
+        net_tx: row.try_get::<i64, _>("net_tx")? as u64,
+        restart_count: row.try_get::<i64, _>("restart_count")? as u32,
+        started_at: started_at
+            .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
+            .transpose()?,
+        updated_at: DateTime::parse_from_rfc3339(row.try_get::<String, _>("updated_at")?.as_str())?
+            .with_timezone(&Utc),
+    })
+}
+
+fn parse_alert_severity(s: &str) -> AlertSeverity {
+    match s {
+        "warning" => AlertSeverity::Warning,
+        "critical" => AlertSeverity::Critical,
+        _ => AlertSeverity::Info,
+    }
+}
+
+fn alert_severity_str(s: AlertSeverity) -> &'static str {
+    match s {
+        AlertSeverity::Info => "info",
+        AlertSeverity::Warning => "warning",
+        AlertSeverity::Critical => "critical",
+    }
+}
+
+fn row_to_alert_rule(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<AlertRule> {
+    let condition_json: String = row.try_get("condition")?;
+    Ok(AlertRule {
+        id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+        name: row.try_get("name")?,
+        condition: serde_json::from_str(&condition_json)?,
+        severity: parse_alert_severity(row.try_get::<String, _>("severity")?.as_str()),
+        enabled: row.try_get("enabled")?,
+    })
+}
+
+fn row_to_alert_event(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<AlertEvent> {
+    let server_id: Option<String> = row.try_get("server_id")?;
+    let resolved_at: Option<String> = row.try_get("resolved_at")?;
+    let notified_at: Option<String> = row.try_get("notified_at")?;
+    Ok(AlertEvent {
+        id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+        rule_id: Uuid::parse_str(row.try_get::<String, _>("rule_id")?.as_str())?,
+        server_id: server_id.map(|s| Uuid::parse_str(&s)).transpose()?,
+        state: if row.try_get::<String, _>("state")?.as_str() == "resolved" {
+            AlertState::Resolved
+        } else {
+            AlertState::Firing
+        },
+        started_at: DateTime::parse_from_rfc3339(row.try_get::<String, _>("started_at")?.as_str())?
+            .with_timezone(&Utc),
+        resolved_at: resolved_at
+            .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
+            .transpose()?,
+        notified_at: notified_at
+            .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
+            .transpose()?,
+    })
+}
+
+fn notification_channel_kind_str(k: NotificationChannelKind) -> &'static str {
+    match k {
+        NotificationChannelKind::Webhook => "webhook",
+        NotificationChannelKind::Email => "email",
+    }
+}
+
+fn row_to_notification_channel(
+    row: &sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<NotificationChannel> {
+    let config_json: String = row.try_get("config")?;
+    Ok(NotificationChannel {
+        id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+        kind: match row.try_get::<String, _>("kind")?.as_str() {
+            "email" => NotificationChannelKind::Email,
+            _ => NotificationChannelKind::Webhook,
+        },
+        config: serde_json::from_str(&config_json)?,
+        enabled: row.try_get("enabled")?,
+    })
+}
+
+fn row_to_incident(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Incident> {
+    let resolved_at: Option<String> = row.try_get("resolved_at")?;
+    let server_id: Option<String> = row.try_get("server_id")?;
+    Ok(Incident {
+        id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+        title: row.try_get("title")?,
+        started_at: DateTime::parse_from_rfc3339(row.try_get::<String, _>("started_at")?.as_str())?
+            .with_timezone(&Utc),
+        resolved_at: resolved_at
+            .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
+            .transpose()?,
+        status: if row.try_get::<String, _>("status")?.as_str() == "resolved" {
+            IncidentStatus::Resolved
+        } else {
+            IncidentStatus::Open
+        },
+        server_id: server_id.map(|s| Uuid::parse_str(&s)).transpose()?,
+    })
+}
+
+fn row_to_incident_event(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<IncidentEvent> {
+    Ok(IncidentEvent {
+        id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+        incident_id: Uuid::parse_str(row.try_get::<String, _>("incident_id")?.as_str())?,
+        ts: DateTime::parse_from_rfc3339(row.try_get::<String, _>("ts")?.as_str())?
+            .with_timezone(&Utc),
+        description: row.try_get("description")?,
+        source_ref: row.try_get("source_ref")?,
     })
 }
 
@@ -751,6 +901,402 @@ impl Store for SqliteStore {
         .transpose()
         .map_err(StoreError::Backend)
     }
+
+    async fn upsert_docker_containers(
+        &self,
+        server_id: Uuid,
+        containers: &[DockerContainer],
+    ) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+
+        sqlx::query("DELETE FROM docker_containers WHERE server_id = ?")
+            .bind(server_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+
+        for c in containers {
+            sqlx::query(
+                "INSERT INTO docker_containers
+                    (server_id, container_id, name, image, state, cpu_pct, mem_used, mem_limit, net_rx, net_tx, restart_count, started_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(server_id.to_string())
+            .bind(&c.container_id)
+            .bind(&c.name)
+            .bind(&c.image)
+            .bind(container_state_str(c.state))
+            .bind(c.cpu_pct)
+            .bind(c.mem_used as i64)
+            .bind(c.mem_limit as i64)
+            .bind(c.net_rx as i64)
+            .bind(c.net_tx as i64)
+            .bind(c.restart_count as i64)
+            .bind(c.started_at.map(|d| d.to_rfc3339()))
+            .bind(c.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_docker_containers(&self, server_id: Uuid) -> StoreResult<Vec<DockerContainer>> {
+        let rows = sqlx::query("SELECT * FROM docker_containers WHERE server_id = ? ORDER BY name")
+            .bind(server_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_docker_container(r).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn create_alert_rule(&self, rule: &AlertRule) -> StoreResult<()> {
+        let condition_json =
+            serde_json::to_string(&rule.condition).map_err(|e| StoreError::Backend(e.into()))?;
+        sqlx::query(
+            "INSERT INTO alert_rules (id, name, condition, severity, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(rule.id.to_string())
+        .bind(&rule.name)
+        .bind(condition_json)
+        .bind(alert_severity_str(rule.severity))
+        .bind(rule.enabled)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_alert_rules(&self) -> StoreResult<Vec<AlertRule>> {
+        let rows = sqlx::query("SELECT * FROM alert_rules ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_alert_rule(r).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn list_enabled_alert_rules(&self) -> StoreResult<Vec<AlertRule>> {
+        let rows = sqlx::query("SELECT * FROM alert_rules WHERE enabled = 1 ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_alert_rule(r).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn delete_alert_rule(&self, id: Uuid) -> StoreResult<()> {
+        sqlx::query("DELETE FROM alert_rules WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn get_open_alert_event(
+        &self,
+        rule_id: Uuid,
+        server_id: Option<Uuid>,
+    ) -> StoreResult<Option<AlertEvent>> {
+        let row = sqlx::query(
+            "SELECT * FROM alert_events
+             WHERE rule_id = ? AND state = 'firing'
+               AND ((server_id IS NULL AND ? IS NULL) OR server_id = ?)
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(rule_id.to_string())
+        .bind(server_id.map(|s| s.to_string()))
+        .bind(server_id.map(|s| s.to_string()))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        row.map(|r| row_to_alert_event(&r).map_err(StoreError::Backend))
+            .transpose()
+    }
+
+    async fn create_alert_event(&self, event: &AlertEvent) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO alert_events (id, rule_id, server_id, state, started_at, resolved_at, notified_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.id.to_string())
+        .bind(event.rule_id.to_string())
+        .bind(event.server_id.map(|s| s.to_string()))
+        .bind(if event.state == AlertState::Firing { "firing" } else { "resolved" })
+        .bind(event.started_at.to_rfc3339())
+        .bind(event.resolved_at.map(|d| d.to_rfc3339()))
+        .bind(event.notified_at.map(|d| d.to_rfc3339()))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn mark_alert_event_notified(&self, id: Uuid, ts: DateTime<Utc>) -> StoreResult<()> {
+        sqlx::query("UPDATE alert_events SET notified_at = ? WHERE id = ?")
+            .bind(ts.to_rfc3339())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn resolve_alert_event(&self, id: Uuid, ts: DateTime<Utc>) -> StoreResult<()> {
+        sqlx::query("UPDATE alert_events SET state = 'resolved', resolved_at = ? WHERE id = ?")
+            .bind(ts.to_rfc3339())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_recent_alert_events(&self, since: DateTime<Utc>) -> StoreResult<Vec<AlertEvent>> {
+        let rows = sqlx::query(
+            "SELECT * FROM alert_events WHERE started_at >= ? ORDER BY started_at DESC",
+        )
+        .bind(since.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_alert_event(r).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn create_notification_channel(&self, channel: &NotificationChannel) -> StoreResult<()> {
+        let config_json =
+            serde_json::to_string(&channel.config).map_err(|e| StoreError::Backend(e.into()))?;
+        sqlx::query(
+            "INSERT INTO notification_channels (id, kind, config, enabled, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(channel.id.to_string())
+        .bind(notification_channel_kind_str(channel.kind))
+        .bind(config_json)
+        .bind(channel.enabled)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_enabled_notification_channels(&self) -> StoreResult<Vec<NotificationChannel>> {
+        let rows = sqlx::query("SELECT * FROM notification_channels WHERE enabled = 1")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_notification_channel(r).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn create_incident(&self, incident: &Incident) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO incidents (id, title, started_at, resolved_at, status, server_id) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(incident.id.to_string())
+        .bind(&incident.title)
+        .bind(incident.started_at.to_rfc3339())
+        .bind(incident.resolved_at.map(|d| d.to_rfc3339()))
+        .bind(if incident.status == IncidentStatus::Open { "open" } else { "resolved" })
+        .bind(incident.server_id.map(|s| s.to_string()))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn find_open_incident_for_server(
+        &self,
+        server_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> StoreResult<Option<Incident>> {
+        let row = sqlx::query(
+            "SELECT * FROM incidents WHERE server_id = ? AND status = 'open' AND started_at >= ?
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(server_id.to_string())
+        .bind(since.to_rfc3339())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        row.map(|r| row_to_incident(&r).map_err(StoreError::Backend))
+            .transpose()
+    }
+
+    async fn resolve_incident(&self, id: Uuid, ts: DateTime<Utc>) -> StoreResult<()> {
+        sqlx::query("UPDATE incidents SET status = 'resolved', resolved_at = ? WHERE id = ?")
+            .bind(ts.to_rfc3339())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn add_incident_event(&self, event: &IncidentEvent) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO incident_events (id, incident_id, ts, description, source_ref) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(event.id.to_string())
+        .bind(event.incident_id.to_string())
+        .bind(event.ts.to_rfc3339())
+        .bind(&event.description)
+        .bind(&event.source_ref)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_incidents(&self) -> StoreResult<Vec<Incident>> {
+        let rows = sqlx::query("SELECT * FROM incidents ORDER BY started_at DESC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_incident(r).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn get_incident(&self, id: Uuid) -> StoreResult<Option<Incident>> {
+        let row = sqlx::query("SELECT * FROM incidents WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        row.map(|r| row_to_incident(&r).map_err(StoreError::Backend))
+            .transpose()
+    }
+
+    async fn list_incident_events(&self, incident_id: Uuid) -> StoreResult<Vec<IncidentEvent>> {
+        let rows = sqlx::query("SELECT * FROM incident_events WHERE incident_id = ? ORDER BY ts")
+            .bind(incident_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_incident_event(r).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn set_server_tags(&self, server_id: Uuid, tags: &[String]) -> StoreResult<()> {
+        let tags_json = serde_json::to_string(tags).map_err(|e| StoreError::Backend(e.into()))?;
+        sqlx::query("UPDATE servers SET tags = ? WHERE id = ?")
+            .bind(tags_json)
+            .bind(server_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_servers_with_tags(&self, tags: &[String]) -> StoreResult<Vec<Server>> {
+        // Tags are stored as a JSON array string; SQLite has no native
+        // array containment operator, so filter by substring match on the
+        // quoted tag — safe because tags never contain a literal `"`.
+        let rows = sqlx::query("SELECT * FROM servers ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_server(r).map_err(StoreError::Backend))
+            .collect::<StoreResult<Vec<_>>>()
+            .map(|servers| {
+                servers
+                    .into_iter()
+                    .filter(|s| tags.iter().all(|t| s.tags.contains(t)))
+                    .collect()
+            })
+    }
+
+    async fn create_group(&self, id: Uuid, name: &str) -> StoreResult<()> {
+        sqlx::query("INSERT INTO server_groups (id, name) VALUES (?, ?)")
+            .bind(id.to_string())
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_groups(&self) -> StoreResult<Vec<(Uuid, String)>> {
+        let rows = sqlx::query("SELECT id, name FROM server_groups ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| {
+                let id = Uuid::parse_str(r.try_get::<String, _>("id")?.as_str())?;
+                let name: String = r.try_get("name")?;
+                Ok((id, name))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(StoreError::Backend)
+    }
+
+    async fn delete_group(&self, id: Uuid) -> StoreResult<()> {
+        sqlx::query("DELETE FROM server_groups WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn add_group_member(&self, group_id: Uuid, server_id: Uuid) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO server_group_members (group_id, server_id) VALUES (?, ?)",
+        )
+        .bind(group_id.to_string())
+        .bind(server_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn remove_group_member(&self, group_id: Uuid, server_id: Uuid) -> StoreResult<()> {
+        sqlx::query("DELETE FROM server_group_members WHERE group_id = ? AND server_id = ?")
+            .bind(group_id.to_string())
+            .bind(server_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_group_members(&self, group_id: Uuid) -> StoreResult<Vec<Server>> {
+        let rows = sqlx::query(
+            "SELECT servers.* FROM servers
+             JOIN server_group_members ON server_group_members.server_id = servers.id
+             WHERE server_group_members.group_id = ?
+             ORDER BY servers.name",
+        )
+        .bind(group_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_server(r).map_err(StoreError::Backend))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1183,5 +1729,261 @@ mod tests {
 
         store.delete_health_check(check.id).await.unwrap();
         assert!(store.list_health_checks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn docker_upsert_replaces_previous_snapshot() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-docker").await.unwrap();
+
+        let nginx = DockerContainer {
+            server_id: server.id,
+            container_id: "abc123".into(),
+            name: "nginx".into(),
+            image: "nginx:latest".into(),
+            state: ContainerState::Running,
+            cpu_pct: 1.5,
+            mem_used: 1024,
+            mem_limit: 2048,
+            net_rx: 10,
+            net_tx: 20,
+            restart_count: 0,
+            started_at: Some(Utc::now()),
+            updated_at: Utc::now(),
+        };
+        store
+            .upsert_docker_containers(server.id, std::slice::from_ref(&nginx))
+            .await
+            .unwrap();
+
+        let containers = store.list_docker_containers(server.id).await.unwrap();
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].state, ContainerState::Running);
+
+        // A container that stopped existing on the host (e.g. removed) is
+        // simply absent from the next report, and the snapshot reflects
+        // that — no stale rows linger.
+        let mut stopped = nginx.clone();
+        stopped.state = ContainerState::Stopped;
+        store
+            .upsert_docker_containers(server.id, &[stopped])
+            .await
+            .unwrap();
+        let containers = store.list_docker_containers(server.id).await.unwrap();
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].state, ContainerState::Stopped);
+
+        store
+            .upsert_docker_containers(server.id, &[])
+            .await
+            .unwrap();
+        assert!(store
+            .list_docker_containers(server.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn alert_rule_and_event_lifecycle() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-alert").await.unwrap();
+
+        let rule = AlertRule {
+            id: Uuid::new_v4(),
+            name: "cpu high".into(),
+            condition: serde_json::json!({"kind": "cpu_above", "threshold_pct": 90.0, "for_secs": 300}),
+            severity: AlertSeverity::Warning,
+            enabled: true,
+        };
+        store.create_alert_rule(&rule).await.unwrap();
+        assert_eq!(store.list_enabled_alert_rules().await.unwrap().len(), 1);
+
+        assert!(store
+            .get_open_alert_event(rule.id, Some(server.id))
+            .await
+            .unwrap()
+            .is_none());
+
+        let event = AlertEvent {
+            id: Uuid::new_v4(),
+            rule_id: rule.id,
+            server_id: Some(server.id),
+            state: AlertState::Firing,
+            started_at: Utc::now(),
+            resolved_at: None,
+            notified_at: None,
+        };
+        store.create_alert_event(&event).await.unwrap();
+
+        let open = store
+            .get_open_alert_event(rule.id, Some(server.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open.id, event.id);
+        assert!(open.notified_at.is_none());
+
+        store
+            .mark_alert_event_notified(event.id, Utc::now())
+            .await
+            .unwrap();
+        let open = store
+            .get_open_alert_event(rule.id, Some(server.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(open.notified_at.is_some());
+
+        store
+            .resolve_alert_event(event.id, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_open_alert_event(rule.id, Some(server.id))
+                .await
+                .unwrap()
+                .is_none(),
+            "a resolved event is no longer open"
+        );
+
+        store.delete_alert_rule(rule.id).await.unwrap();
+        assert!(store.list_alert_rules().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_channels_roundtrip() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let channel = NotificationChannel {
+            id: Uuid::new_v4(),
+            kind: NotificationChannelKind::Webhook,
+            config: serde_json::json!({"url": "https://example.com/hook"}),
+            enabled: true,
+        };
+        store.create_notification_channel(&channel).await.unwrap();
+
+        let channels = store.list_enabled_notification_channels().await.unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].kind, NotificationChannelKind::Webhook);
+        assert_eq!(channels[0].config["url"], "https://example.com/hook");
+    }
+
+    #[tokio::test]
+    async fn incident_correlation_and_timeline() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-incident").await.unwrap();
+
+        assert!(store
+            .find_open_incident_for_server(server.id, Utc::now() - chrono::Duration::minutes(10))
+            .await
+            .unwrap()
+            .is_none());
+
+        let incident = Incident {
+            id: Uuid::new_v4(),
+            title: "VPS-01 issues".into(),
+            started_at: Utc::now(),
+            resolved_at: None,
+            status: IncidentStatus::Open,
+            server_id: Some(server.id),
+        };
+        store.create_incident(&incident).await.unwrap();
+
+        let found = store
+            .find_open_incident_for_server(server.id, Utc::now() - chrono::Duration::minutes(10))
+            .await
+            .unwrap()
+            .expect("the incident just created for this server should be found as open");
+        assert_eq!(found.id, incident.id);
+
+        store
+            .add_incident_event(&IncidentEvent {
+                id: Uuid::new_v4(),
+                incident_id: incident.id,
+                ts: Utc::now(),
+                description: "CPU exceeded 90%".into(),
+                source_ref: None,
+            })
+            .await
+            .unwrap();
+
+        let events = store.list_incident_events(incident.id).await.unwrap();
+        assert_eq!(events.len(), 1);
+
+        store
+            .resolve_incident(incident.id, Utc::now())
+            .await
+            .unwrap();
+        let fetched = store.get_incident(incident.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, IncidentStatus::Resolved);
+        assert!(fetched.resolved_at.is_some());
+
+        assert_eq!(store.list_incidents().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tag_filtering_requires_all_tags() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut prod_docker = sample_server();
+        prod_docker.name = "prod-docker".into();
+        store.create_server(&prod_docker, "hash-t1").await.unwrap();
+        store
+            .set_server_tags(prod_docker.id, &["production".into(), "docker".into()])
+            .await
+            .unwrap();
+
+        let mut prod_only = sample_server();
+        prod_only.id = Uuid::new_v4();
+        prod_only.name = "prod-only".into();
+        store.create_server(&prod_only, "hash-t2").await.unwrap();
+        store
+            .set_server_tags(prod_only.id, &["production".into()])
+            .await
+            .unwrap();
+
+        let both = store
+            .list_servers_with_tags(&["production".into(), "docker".into()])
+            .await
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].name, "prod-docker");
+
+        let just_prod = store
+            .list_servers_with_tags(&["production".into()])
+            .await
+            .unwrap();
+        assert_eq!(just_prod.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn groups_crud_and_membership() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-group").await.unwrap();
+
+        let group_id = Uuid::new_v4();
+        store.create_group(group_id, "production").await.unwrap();
+        assert_eq!(
+            store.list_groups().await.unwrap(),
+            vec![(group_id, "production".to_string())]
+        );
+
+        store.add_group_member(group_id, server.id).await.unwrap();
+        let members = store.list_group_members(group_id).await.unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].id, server.id);
+
+        store
+            .remove_group_member(group_id, server.id)
+            .await
+            .unwrap();
+        assert!(store.list_group_members(group_id).await.unwrap().is_empty());
+
+        store.delete_group(group_id).await.unwrap();
+        assert!(store.list_groups().await.unwrap().is_empty());
     }
 }

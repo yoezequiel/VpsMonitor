@@ -1,5 +1,5 @@
-//! Periodic jobs: heartbeat-timeout detection, metrics downsampling, and
-//! health check execution. Alert rule evaluation joins this module next.
+//! Periodic jobs: heartbeat-timeout detection, metrics downsampling,
+//! health check execution, and alert rule evaluation.
 
 use std::time::Duration;
 
@@ -153,4 +153,22 @@ pub fn spawn_health_checks(
     poll_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_health_checks(state, poll_interval))
+}
+
+/// Every `poll_interval`, evaluates every enabled alert rule against
+/// current state (metrics, server status, Docker containers, health
+/// check results) — see `alerting::evaluate_rules`.
+pub async fn run_alert_evaluation(state: AppState, poll_interval: Duration) {
+    let mut ticker = tokio::time::interval(poll_interval);
+    loop {
+        ticker.tick().await;
+        crate::alerting::evaluate_rules(&state).await;
+    }
+}
+
+pub fn spawn_alert_evaluation(
+    state: AppState,
+    poll_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_alert_evaluation(state, poll_interval))
 }

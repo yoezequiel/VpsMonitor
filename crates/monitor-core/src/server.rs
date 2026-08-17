@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use agent_core::collector::Collector;
 use axum_server::tls_rustls::RustlsConfig;
+use chrono::Utc;
 use shared::ServerStatus;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
@@ -62,6 +63,7 @@ pub async fn run(params: ServerParams) -> anyhow::Result<()> {
         Duration::from_secs(10),
     );
     scheduler::spawn_health_checks(state.clone(), Duration::from_secs(10));
+    scheduler::spawn_alert_evaluation(state.clone(), Duration::from_secs(15));
     scheduler::spawn_metrics_rollup(
         state.clone(),
         params.raw_metrics_retention,
@@ -105,6 +107,7 @@ pub async fn run(params: ServerParams) -> anyhow::Result<()> {
 /// HTTP client back to this same process (see PLAN.md section 5 risks).
 async fn self_monitor_loop(state: AppState, server_id: Uuid) {
     let mut collector = Collector::new();
+    let docker = agent_core::docker::DockerCollector::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
     loop {
         ticker.tick().await;
@@ -120,6 +123,36 @@ async fn self_monitor_loop(state: AppState, server_id: Uuid) {
         });
         if let Err(err) = state.store.insert_metric(&metric).await {
             tracing::warn!(%err, "self-monitor: metric insert failed");
+        }
+
+        if docker.available() {
+            let containers: Vec<shared::DockerContainer> = docker
+                .collect()
+                .await
+                .into_iter()
+                .map(|c| shared::DockerContainer {
+                    server_id,
+                    container_id: c.container_id,
+                    name: c.name,
+                    image: c.image,
+                    state: c.state,
+                    cpu_pct: c.cpu_pct,
+                    mem_used: c.mem_used,
+                    mem_limit: c.mem_limit,
+                    net_rx: c.net_rx,
+                    net_tx: c.net_tx,
+                    restart_count: c.restart_count,
+                    started_at: c.started_at,
+                    updated_at: Utc::now(),
+                })
+                .collect();
+            if let Err(err) = state
+                .store
+                .upsert_docker_containers(server_id, &containers)
+                .await
+            {
+                tracing::warn!(%err, "self-monitor: docker upsert failed");
+            }
         }
     }
 }

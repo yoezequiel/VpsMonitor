@@ -6,7 +6,10 @@ pub use sqlite::SqliteStore;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use shared::{HealthCheck, HealthCheckResult, Metric, Server, User};
+use shared::{
+    AlertEvent, AlertRule, DockerContainer, HealthCheck, HealthCheckResult, Incident,
+    IncidentEvent, Metric, NotificationChannel, Server, User,
+};
 use uuid::Uuid;
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -15,9 +18,6 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// SQLite (see `monitor-core::store::sqlite`, added in Fase 1); PostgreSQL
 /// support (V4) is expected to implement this same trait so the rest of the
 /// codebase stays backend-agnostic.
-///
-/// Alerts and incidents get their own trait methods once those V2 features
-/// land — adding them here now would be speculative.
 #[async_trait]
 pub trait Store: Send + Sync {
     // -- servers ---------------------------------------------------------
@@ -125,4 +125,68 @@ pub trait Store: Send + Sync {
         &self,
         health_check_id: Uuid,
     ) -> StoreResult<Option<DateTime<Utc>>>;
+
+    // -- docker ---------------------------------------------------------------
+    /// Replaces the stored snapshot for every container on `server_id`
+    /// with `containers` (upsert by container_id, drop rows for
+    /// containers no longer reported — they were removed from the host).
+    async fn upsert_docker_containers(
+        &self,
+        server_id: Uuid,
+        containers: &[DockerContainer],
+    ) -> StoreResult<()>;
+    async fn list_docker_containers(&self, server_id: Uuid) -> StoreResult<Vec<DockerContainer>>;
+
+    // -- alert rules -------------------------------------------------------
+    async fn create_alert_rule(&self, rule: &AlertRule) -> StoreResult<()>;
+    async fn list_alert_rules(&self) -> StoreResult<Vec<AlertRule>>;
+    async fn list_enabled_alert_rules(&self) -> StoreResult<Vec<AlertRule>>;
+    async fn delete_alert_rule(&self, id: Uuid) -> StoreResult<()>;
+
+    // -- alert events --------------------------------------------------------
+    /// The still-open (unresolved) event for this rule/server pair, if
+    /// any — a rule evaluates to at most one open event per server at a
+    /// time, which is what lets the evaluator tell "still firing" apart
+    /// from "newly firing".
+    async fn get_open_alert_event(
+        &self,
+        rule_id: Uuid,
+        server_id: Option<Uuid>,
+    ) -> StoreResult<Option<AlertEvent>>;
+    async fn create_alert_event(&self, event: &AlertEvent) -> StoreResult<()>;
+    async fn mark_alert_event_notified(&self, id: Uuid, ts: DateTime<Utc>) -> StoreResult<()>;
+    async fn resolve_alert_event(&self, id: Uuid, ts: DateTime<Utc>) -> StoreResult<()>;
+    async fn list_recent_alert_events(&self, since: DateTime<Utc>) -> StoreResult<Vec<AlertEvent>>;
+
+    // -- notification channels ------------------------------------------------
+    async fn create_notification_channel(&self, channel: &NotificationChannel) -> StoreResult<()>;
+    async fn list_enabled_notification_channels(&self) -> StoreResult<Vec<NotificationChannel>>;
+
+    // -- incidents --------------------------------------------------------------
+    async fn create_incident(&self, incident: &Incident) -> StoreResult<()>;
+    /// The most recent still-open incident for this server that started
+    /// within the correlation window, if any — used to fold a newly
+    /// firing alert into an existing incident instead of opening a new
+    /// one for every related event.
+    async fn find_open_incident_for_server(
+        &self,
+        server_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> StoreResult<Option<Incident>>;
+    async fn resolve_incident(&self, id: Uuid, ts: DateTime<Utc>) -> StoreResult<()>;
+    async fn add_incident_event(&self, event: &IncidentEvent) -> StoreResult<()>;
+    async fn list_incidents(&self) -> StoreResult<Vec<Incident>>;
+    async fn get_incident(&self, id: Uuid) -> StoreResult<Option<Incident>>;
+    async fn list_incident_events(&self, incident_id: Uuid) -> StoreResult<Vec<IncidentEvent>>;
+
+    // -- tags / groups ------------------------------------------------------------
+    async fn set_server_tags(&self, server_id: Uuid, tags: &[String]) -> StoreResult<()>;
+    async fn list_servers_with_tags(&self, tags: &[String]) -> StoreResult<Vec<Server>>;
+
+    async fn create_group(&self, id: Uuid, name: &str) -> StoreResult<()>;
+    async fn list_groups(&self) -> StoreResult<Vec<(Uuid, String)>>;
+    async fn delete_group(&self, id: Uuid) -> StoreResult<()>;
+    async fn add_group_member(&self, group_id: Uuid, server_id: Uuid) -> StoreResult<()>;
+    async fn remove_group_member(&self, group_id: Uuid, server_id: Uuid) -> StoreResult<()>;
+    async fn list_group_members(&self, group_id: Uuid) -> StoreResult<Vec<Server>>;
 }
