@@ -53,12 +53,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Agent { command } => match command {
             AgentCommand::Status => commands::agent::status().await?,
         },
-        Command::Alerts => println!("monitor alerts: not implemented yet (V2)"),
+        Command::Alerts => commands::alerts::list().await?,
         Command::Logs { server, level } => {
             println!("monitor logs (server={server:?}, level={level:?}): not implemented yet (V2)")
         }
         Command::Incident { command } => match command {
-            IncidentCommand::List => println!("monitor incident list: not implemented yet (V2)"),
+            IncidentCommand::List => commands::incident::list().await?,
         },
     }
 

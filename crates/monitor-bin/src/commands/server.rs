@@ -1,16 +1,7 @@
 use monitor_core::store::SqliteStore;
 use monitor_core::{api, tls, Store};
 
-use config::{Config, MonitorConfig};
-
-async fn require_monitor() -> anyhow::Result<MonitorConfig> {
-    let config = Config::load()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("not installed. Run `monitor install` first."))?;
-    config
-        .monitor
-        .ok_or_else(|| anyhow::anyhow!("this node is not a Monitor (Agent-only install)"))
-}
+use super::common::require_monitor;
 
 pub async fn list() -> anyhow::Result<()> {
     let monitor_cfg = require_monitor().await?;
