@@ -3,6 +3,7 @@ pub mod alerts;
 mod common;
 pub mod incident;
 pub mod install;
+pub mod logs;
 pub mod run;
 pub mod server;
 pub mod status;

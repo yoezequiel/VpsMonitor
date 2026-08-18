@@ -7,6 +7,9 @@ import type {
   HealthCheckResult,
   Incident,
   IncidentEvent,
+  LogEntry,
+  LogLevel,
+  LogSource,
   Metric,
   NotificationChannel,
   Server,
@@ -182,6 +185,24 @@ export function addGroupMember(groupId: string, serverId: string): Promise<void>
 
 export function removeGroupMember(groupId: string, serverId: string): Promise<void> {
   return request(`/api/groups/${groupId}/members/${serverId}`, { method: 'DELETE' })
+}
+
+export function listLogs(filter: {
+  serverId?: string
+  source?: LogSource
+  level?: LogLevel
+  q?: string
+  sinceHours?: number
+  limit?: number
+}): Promise<LogEntry[]> {
+  const params = new URLSearchParams()
+  if (filter.serverId) params.set('server_id', filter.serverId)
+  if (filter.source) params.set('source', filter.source)
+  if (filter.level) params.set('level', filter.level)
+  if (filter.q) params.set('q', filter.q)
+  if (filter.limit) params.set('limit', String(filter.limit))
+  params.set('since', new Date(Date.now() - (filter.sinceHours ?? 24) * 3600_000).toISOString())
+  return request(`/api/logs?${params.toString()}`)
 }
 
 export function connectStatusStream(onEvent: (event: ServerStatusEvent) => void): () => void {

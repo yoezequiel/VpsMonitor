@@ -69,3 +69,21 @@ pub struct DockerReportRequest {
     pub ts: DateTime<Utc>,
     pub containers: Vec<DockerContainerReport>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntryReport {
+    pub source: crate::LogSource,
+    pub container_name: Option<String>,
+    pub level: crate::LogLevel,
+    pub message: String,
+    pub ts: DateTime<Utc>,
+}
+
+/// A batch of buffered log lines, sent each reporting cycle. Batched
+/// rather than streamed line-by-line so a chatty burst doesn't turn into
+/// a request per line — see `agent_core::reporter::run_loop`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsReportRequest {
+    pub server_id: Uuid,
+    pub entries: Vec<LogEntryReport>,
+}

@@ -53,6 +53,7 @@ async fn run_monitor(
         rollup_metrics_retention: Duration::from_secs(
             monitor_cfg.metrics_rollup_retention_days * 86400,
         ),
+        logs_retention: Duration::from_secs(monitor_cfg.logs_retention_hours * 3600),
         self_server_id,
     })
     .await

@@ -143,6 +143,7 @@ async fn install_monitor(
         heartbeat_timeout_s: 60,
         metrics_raw_retention_hours: 24,
         metrics_rollup_retention_days: 30,
+        logs_retention_hours: 72,
         self_server_id: None,
         static_dir: find_dashboard_build(),
     })

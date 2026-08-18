@@ -1,12 +1,18 @@
 mod commands;
+mod logtap;
 
 use clap::Parser;
 use cli::{AgentCommand, Cli, Command, IncidentCommand, ServerCommand};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer())
+        .with(logtap::LogTapLayer)
         .init();
 
     // Multiple dependencies (axum-server's rustls backend, reqwest's TLS
@@ -54,9 +60,7 @@ async fn main() -> anyhow::Result<()> {
             AgentCommand::Status => commands::agent::status().await?,
         },
         Command::Alerts => commands::alerts::list().await?,
-        Command::Logs { server, level } => {
-            println!("monitor logs (server={server:?}, level={level:?}): not implemented yet (V2)")
-        }
+        Command::Logs { server, level } => commands::logs::run(server, level).await?,
         Command::Incident { command } => match command {
             IncidentCommand::List => commands::incident::list().await?,
         },

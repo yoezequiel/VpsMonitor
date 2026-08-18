@@ -4,14 +4,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use shared::{
     AlertEvent, AlertRule, AlertSeverity, AlertState, ContainerState, DockerContainer, HealthCheck,
-    HealthCheckResult, HealthCheckType, Incident, IncidentEvent, IncidentStatus,
-    NotificationChannel, NotificationChannelKind, Server, ServerStatus, User,
+    HealthCheckResult, HealthCheckType, Incident, IncidentEvent, IncidentStatus, LogEntry,
+    LogLevel, LogSource, NotificationChannel, NotificationChannelKind, Server, ServerStatus, User,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
-use super::{Store, StoreError, StoreResult};
+use super::{LogQuery, Store, StoreError, StoreResult};
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -152,6 +152,55 @@ fn row_to_docker_container(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Dock
             .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
             .transpose()?,
         updated_at: DateTime::parse_from_rfc3339(row.try_get::<String, _>("updated_at")?.as_str())?
+            .with_timezone(&Utc),
+    })
+}
+
+fn parse_log_level(s: &str) -> LogLevel {
+    match s {
+        "trace" => LogLevel::Trace,
+        "debug" => LogLevel::Debug,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    }
+}
+
+fn log_level_str(l: LogLevel) -> &'static str {
+    match l {
+        LogLevel::Trace => "trace",
+        LogLevel::Debug => "debug",
+        LogLevel::Info => "info",
+        LogLevel::Warn => "warn",
+        LogLevel::Error => "error",
+    }
+}
+
+fn parse_log_source(s: &str) -> LogSource {
+    match s {
+        "monitor" => LogSource::Monitor,
+        "docker" => LogSource::Docker,
+        _ => LogSource::Agent,
+    }
+}
+
+fn log_source_str(s: LogSource) -> &'static str {
+    match s {
+        LogSource::Agent => "agent",
+        LogSource::Monitor => "monitor",
+        LogSource::Docker => "docker",
+    }
+}
+
+fn row_to_log_entry(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<LogEntry> {
+    Ok(LogEntry {
+        id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str())?,
+        server_id: Uuid::parse_str(row.try_get::<String, _>("server_id")?.as_str())?,
+        source: parse_log_source(row.try_get::<String, _>("source")?.as_str()),
+        container_name: row.try_get("container_name")?,
+        level: parse_log_level(row.try_get::<String, _>("level")?.as_str()),
+        message: row.try_get("message")?,
+        ts: DateTime::parse_from_rfc3339(row.try_get::<String, _>("ts")?.as_str())?
             .with_timezone(&Utc),
     })
 }
@@ -1297,6 +1346,106 @@ impl Store for SqliteStore {
             .map(|r| row_to_server(r).map_err(StoreError::Backend))
             .collect()
     }
+
+    async fn insert_logs(&self, entries: &[LogEntry]) -> StoreResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        for entry in entries {
+            sqlx::query(
+                "INSERT INTO logs (id, server_id, source, container_name, level, message, ts)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(entry.id.to_string())
+            .bind(entry.server_id.to_string())
+            .bind(log_source_str(entry.source))
+            .bind(&entry.container_name)
+            .bind(log_level_str(entry.level))
+            .bind(&entry.message)
+            .bind(entry.ts.to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        Ok(())
+    }
+
+    async fn list_logs(&self, query: &LogQuery) -> StoreResult<Vec<LogEntry>> {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT * FROM logs WHERE 1 = 1");
+
+        if let Some(server_id) = query.server_id {
+            builder
+                .push(" AND server_id = ")
+                .push_bind(server_id.to_string());
+        }
+        if let Some(source) = query.source {
+            builder
+                .push(" AND source = ")
+                .push_bind(log_source_str(source));
+        }
+        if let Some(min_level) = query.min_level {
+            // Levels sort by severity in declaration order, so "at least
+            // this severe" is every level string at or after it.
+            let levels: Vec<&'static str> = [
+                LogLevel::Trace,
+                LogLevel::Debug,
+                LogLevel::Info,
+                LogLevel::Warn,
+                LogLevel::Error,
+            ]
+            .into_iter()
+            .filter(|l| *l >= min_level)
+            .map(log_level_str)
+            .collect();
+            builder.push(" AND level IN (");
+            let mut separated = builder.separated(", ");
+            for level in levels {
+                separated.push_bind(level);
+            }
+            separated.push_unseparated(")");
+        }
+        if let Some(q) = &query.q {
+            builder
+                .push(" AND message LIKE ")
+                .push_bind(format!("%{q}%"));
+        }
+        if let Some(since) = query.since {
+            builder.push(" AND ts >= ").push_bind(since.to_rfc3339());
+        }
+        if let Some(until) = query.until {
+            builder.push(" AND ts <= ").push_bind(until.to_rfc3339());
+        }
+        builder
+            .push(" ORDER BY ts DESC LIMIT ")
+            .push_bind(query.limit as i64);
+
+        let rows = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?;
+        rows.iter()
+            .map(|r| row_to_log_entry(r).map_err(StoreError::Backend))
+            .collect()
+    }
+
+    async fn prune_logs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        let deleted = sqlx::query("DELETE FROM logs WHERE ts < ?")
+            .bind(before.to_rfc3339())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Backend(e.into()))?
+            .rows_affected();
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]
@@ -1985,5 +2134,175 @@ mod tests {
 
         store.delete_group(group_id).await.unwrap();
         assert!(store.list_groups().await.unwrap().is_empty());
+    }
+
+    fn sample_log(server_id: Uuid, source: LogSource, level: LogLevel, message: &str) -> LogEntry {
+        LogEntry {
+            id: Uuid::new_v4(),
+            server_id,
+            source,
+            container_name: None,
+            level,
+            message: message.into(),
+            ts: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_list_logs_roundtrips() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-logs").await.unwrap();
+
+        let entries = vec![
+            sample_log(
+                server.id,
+                LogSource::Agent,
+                LogLevel::Info,
+                "heartbeat sent",
+            ),
+            sample_log(
+                server.id,
+                LogSource::Docker,
+                LogLevel::Error,
+                "container nginx exited",
+            ),
+        ];
+        store.insert_logs(&entries).await.unwrap();
+
+        let all = store
+            .list_logs(&LogQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_logs_filters_by_min_level_source_and_text() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-logs-2").await.unwrap();
+
+        store
+            .insert_logs(&[
+                sample_log(server.id, LogSource::Agent, LogLevel::Debug, "polling"),
+                sample_log(
+                    server.id,
+                    LogSource::Agent,
+                    LogLevel::Warn,
+                    "retrying request",
+                ),
+                sample_log(
+                    server.id,
+                    LogSource::Docker,
+                    LogLevel::Error,
+                    "container nginx exited",
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let warn_and_above = store
+            .list_logs(&LogQuery {
+                min_level: Some(LogLevel::Warn),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(warn_and_above.len(), 2);
+        assert!(warn_and_above.iter().all(|e| e.level >= LogLevel::Warn));
+
+        let docker_only = store
+            .list_logs(&LogQuery {
+                source: Some(LogSource::Docker),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(docker_only.len(), 1);
+        assert_eq!(docker_only[0].message, "container nginx exited");
+
+        let text_match = store
+            .list_logs(&LogQuery {
+                q: Some("nginx".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(text_match.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_logs_respects_server_scope_and_limit() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let a = sample_server();
+        store.create_server(&a, "hash-a").await.unwrap();
+        let mut b = sample_server();
+        b.id = Uuid::new_v4();
+        b.name = "vps-02".into();
+        store.create_server(&b, "hash-b").await.unwrap();
+
+        store
+            .insert_logs(&[
+                sample_log(a.id, LogSource::Agent, LogLevel::Info, "a-1"),
+                sample_log(a.id, LogSource::Agent, LogLevel::Info, "a-2"),
+                sample_log(b.id, LogSource::Agent, LogLevel::Info, "b-1"),
+            ])
+            .await
+            .unwrap();
+
+        let for_a = store
+            .list_logs(&LogQuery {
+                server_id: Some(a.id),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(for_a.len(), 2);
+        assert!(for_a.iter().all(|e| e.server_id == a.id));
+
+        let limited = store
+            .list_logs(&LogQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_logs_deletes_only_older_entries() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let server = sample_server();
+        store.create_server(&server, "hash-prune").await.unwrap();
+
+        let mut old = sample_log(server.id, LogSource::Agent, LogLevel::Info, "old");
+        old.ts = Utc::now() - chrono::Duration::days(2);
+        let recent = sample_log(server.id, LogSource::Agent, LogLevel::Info, "recent");
+        store.insert_logs(&[old, recent]).await.unwrap();
+
+        let deleted = store
+            .prune_logs(Utc::now() - chrono::Duration::days(1))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining = store
+            .list_logs(&LogQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].message, "recent");
     }
 }

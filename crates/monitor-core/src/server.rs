@@ -43,6 +43,7 @@ pub struct ServerParams {
     pub heartbeat_timeout: Duration,
     pub raw_metrics_retention: Duration,
     pub rollup_metrics_retention: Duration,
+    pub logs_retention: Duration,
     /// Set when this node is also monitoring itself (Monitor+Agent): the
     /// id of the server row it registered for itself.
     pub self_server_id: Option<Uuid>,
@@ -68,6 +69,11 @@ pub async fn run(params: ServerParams) -> anyhow::Result<()> {
         state.clone(),
         params.raw_metrics_retention,
         params.rollup_metrics_retention,
+        Duration::from_secs(15 * 60),
+    );
+    scheduler::spawn_logs_prune(
+        state.clone(),
+        params.logs_retention,
         Duration::from_secs(15 * 60),
     );
 
@@ -108,6 +114,7 @@ pub async fn run(params: ServerParams) -> anyhow::Result<()> {
 async fn self_monitor_loop(state: AppState, server_id: Uuid) {
     let mut collector = Collector::new();
     let docker = agent_core::docker::DockerCollector::new();
+    let mut log_tailer = agent_core::logs::DockerLogTailer::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
     loop {
         ticker.tick().await;
@@ -125,10 +132,36 @@ async fn self_monitor_loop(state: AppState, server_id: Uuid) {
             tracing::warn!(%err, "self-monitor: metric insert failed");
         }
 
+        let mut log_entries: Vec<shared::LogEntry> = shared::logbuf::drain()
+            .into_iter()
+            .map(|e| shared::LogEntry {
+                id: Uuid::new_v4(),
+                server_id,
+                source: shared::LogSource::Monitor,
+                container_name: None,
+                level: e.level,
+                message: e.message,
+                ts: e.ts,
+            })
+            .collect();
+
         if docker.available() {
-            let containers: Vec<shared::DockerContainer> = docker
-                .collect()
-                .await
+            let reports = docker.collect().await;
+            if let Some(client) = docker.client() {
+                log_entries.extend(log_tailer.collect(client, &reports).await.into_iter().map(
+                    |e| shared::LogEntry {
+                        id: Uuid::new_v4(),
+                        server_id,
+                        source: e.source,
+                        container_name: e.container_name,
+                        level: e.level,
+                        message: e.message,
+                        ts: e.ts,
+                    },
+                ));
+            }
+
+            let containers: Vec<shared::DockerContainer> = reports
                 .into_iter()
                 .map(|c| shared::DockerContainer {
                     server_id,
@@ -152,6 +185,12 @@ async fn self_monitor_loop(state: AppState, server_id: Uuid) {
                 .await
             {
                 tracing::warn!(%err, "self-monitor: docker upsert failed");
+            }
+        }
+
+        if !log_entries.is_empty() {
+            if let Err(err) = state.store.insert_logs(&log_entries).await {
+                tracing::warn!(%err, "self-monitor: log insert failed");
             }
         }
     }

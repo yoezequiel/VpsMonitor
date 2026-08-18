@@ -26,6 +26,13 @@ impl DockerCollector {
         self.docker.is_some()
     }
 
+    /// The underlying client, for callers (e.g. `logs::DockerLogTailer`)
+    /// that need to talk to the Docker Engine API directly instead of
+    /// through `collect`.
+    pub fn client(&self) -> Option<&Docker> {
+        self.docker.as_ref()
+    }
+
     pub async fn collect(&self) -> Vec<DockerContainerReport> {
         let Some(docker) = &self.docker else {
             return Vec::new();

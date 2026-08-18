@@ -5,19 +5,20 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::proto::{
-    DockerReportRequest, HeartbeatRequest, MetricsRequest, RegisterRequest, RegisterResponse,
+    DockerReportRequest, HeartbeatRequest, LogsReportRequest, MetricsRequest, RegisterRequest,
+    RegisterResponse,
 };
 use shared::{
     AlertEvent, AlertRule, AlertSeverity, DockerContainer, HealthCheck, HealthCheckResult,
-    HealthCheckType, Incident, IncidentEvent, Metric, NotificationChannel, NotificationChannelKind,
-    Server, ServerStatus,
+    HealthCheckType, Incident, IncidentEvent, LogEntry, LogLevel, LogSource, Metric,
+    NotificationChannel, NotificationChannelKind, Server, ServerStatus,
 };
 use uuid::Uuid;
 
 use crate::auth::{self, AuthAgent, AuthUser};
 use crate::error::ApiError;
 use crate::state::{AppState, ServerStatusEvent};
-use crate::store::Store;
+use crate::store::{LogQuery, Store};
 use crate::ws::ws_handler;
 
 pub fn router(state: AppState) -> Router {
@@ -28,6 +29,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agent/heartbeat", post(heartbeat))
         .route("/api/agent/metrics", post(ingest_metrics))
         .route("/api/agent/docker", post(ingest_docker))
+        .route("/api/agent/logs", post(ingest_logs))
+        .route("/api/logs", get(list_logs))
         .route("/api/servers", get(list_servers))
         .route("/api/servers/{id}", get(get_server))
         .route("/api/servers/{id}/metrics", get(list_metrics))
@@ -238,6 +241,62 @@ async fn ingest_docker(
         .upsert_docker_containers(server.id, &containers)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn ingest_logs(
+    State(state): State<AppState>,
+    AuthAgent(server): AuthAgent,
+    Json(req): Json<LogsReportRequest>,
+) -> Result<StatusCode, ApiError> {
+    if req.server_id != server.id {
+        return Err(ApiError::BadRequest(
+            "server_id does not match token".into(),
+        ));
+    }
+    let entries: Vec<LogEntry> = req
+        .entries
+        .into_iter()
+        .map(|e| LogEntry {
+            id: Uuid::new_v4(),
+            server_id: server.id,
+            source: e.source,
+            container_name: e.container_name,
+            level: e.level,
+            message: e.message,
+            ts: e.ts,
+        })
+        .collect();
+    state.store.insert_logs(&entries).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct ListLogsQuery {
+    server_id: Option<Uuid>,
+    source: Option<LogSource>,
+    /// Minimum severity — "warn" returns warn and error both.
+    level: Option<LogLevel>,
+    q: Option<String>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    limit: Option<u32>,
+}
+
+async fn list_logs(
+    State(state): State<AppState>,
+    AuthUser(_): AuthUser,
+    Query(params): Query<ListLogsQuery>,
+) -> Result<Json<Vec<LogEntry>>, ApiError> {
+    let query = LogQuery {
+        server_id: params.server_id,
+        source: params.source,
+        min_level: params.level,
+        q: params.q.filter(|q| !q.trim().is_empty()),
+        since: params.since,
+        until: params.until,
+        limit: params.limit.unwrap_or(200).min(1000),
+    };
+    Ok(Json(state.store.list_logs(&query).await?))
 }
 
 async fn list_docker_containers(

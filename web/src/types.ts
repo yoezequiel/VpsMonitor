@@ -151,3 +151,16 @@ export interface Group {
   id: string
   name: string
 }
+
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error'
+export type LogSource = 'agent' | 'monitor' | 'docker'
+
+export interface LogEntry {
+  id: string
+  server_id: string
+  source: LogSource
+  container_name: string | null
+  level: LogLevel
+  message: string
+  ts: string
+}

@@ -1,6 +1,7 @@
 use chrono::Utc;
 use shared::proto::{
-    DockerReportRequest, HeartbeatRequest, MetricsRequest, RegisterRequest, RegisterResponse,
+    DockerReportRequest, HeartbeatRequest, LogEntryReport, LogsReportRequest, MetricsRequest,
+    RegisterRequest, RegisterResponse,
 };
 use uuid::Uuid;
 
@@ -110,6 +111,15 @@ impl Reporter {
         self.authed_post("/api/agent/docker", &req).await
     }
 
+    pub async fn send_logs(
+        &self,
+        server_id: Uuid,
+        entries: Vec<LogEntryReport>,
+    ) -> anyhow::Result<()> {
+        let req = LogsReportRequest { server_id, entries };
+        self.authed_post("/api/agent/logs", &req).await
+    }
+
     async fn authed_post<T: serde::Serialize>(&self, path: &str, body: &T) -> anyhow::Result<()> {
         let token = self
             .agent_token
@@ -140,6 +150,7 @@ pub async fn run_loop(
     if docker.available() {
         tracing::info!("Docker detected — container monitoring enabled");
     }
+    let mut log_tailer = super::logs::DockerLogTailer::new();
 
     let mut ticker = tokio::time::interval(interval);
     loop {
@@ -155,10 +166,30 @@ pub async fn run_loop(
             tracing::warn!(%err, "metrics report failed");
         }
 
+        let mut log_entries: Vec<LogEntryReport> = shared::logbuf::drain()
+            .into_iter()
+            .map(|e| LogEntryReport {
+                source: shared::LogSource::Agent,
+                container_name: None,
+                level: e.level,
+                message: e.message,
+                ts: e.ts,
+            })
+            .collect();
+
         if docker.available() {
             let containers = docker.collect().await;
+            if let Some(client) = docker.client() {
+                log_entries.extend(log_tailer.collect(client, &containers).await);
+            }
             if let Err(err) = reporter.send_docker_report(server_id, containers).await {
                 tracing::warn!(%err, "docker report failed");
+            }
+        }
+
+        if !log_entries.is_empty() {
+            if let Err(err) = reporter.send_logs(server_id, log_entries).await {
+                tracing::warn!(%err, "logs report failed");
             }
         }
     }
@@ -277,6 +308,33 @@ mod tests {
         let reporter = Reporter::new(server.uri()).with_agent_token("permanent-token");
         reporter
             .send_metrics(&sample_metric(server_id))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_logs_sends_bearer_token() {
+        let server = MockServer::start().await;
+        let server_id = Uuid::new_v4();
+        Mock::given(method("POST"))
+            .and(path("/api/agent/logs"))
+            .and(bearer_token("permanent-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let reporter = Reporter::new(server.uri()).with_agent_token("permanent-token");
+        reporter
+            .send_logs(
+                server_id,
+                vec![LogEntryReport {
+                    source: shared::LogSource::Agent,
+                    container_name: None,
+                    level: shared::LogLevel::Info,
+                    message: "heartbeat sent".into(),
+                    ts: Utc::now(),
+                }],
+            )
             .await
             .unwrap();
     }

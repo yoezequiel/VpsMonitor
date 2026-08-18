@@ -172,3 +172,31 @@ pub fn spawn_alert_evaluation(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_alert_evaluation(state, poll_interval))
 }
+
+/// Every `poll_interval`, deletes log lines older than `retention` — see
+/// `Store::prune_logs`. Keeps `logs` bounded the same way
+/// `run_metrics_rollup` keeps `metrics` bounded.
+pub async fn run_logs_prune(state: AppState, retention: Duration, poll_interval: Duration) {
+    let mut ticker = tokio::time::interval(poll_interval);
+    loop {
+        ticker.tick().await;
+
+        let cutoff =
+            Utc::now() - chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::days(3));
+        match state.store.prune_logs(cutoff).await {
+            Ok(deleted) if deleted > 0 => {
+                tracing::info!(deleted, "log retention pass complete");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!(%err, "logs prune: failed to query store"),
+        }
+    }
+}
+
+pub fn spawn_logs_prune(
+    state: AppState,
+    retention: Duration,
+    poll_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_logs_prune(state, retention, poll_interval))
+}

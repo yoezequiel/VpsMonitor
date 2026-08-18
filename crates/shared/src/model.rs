@@ -279,6 +279,39 @@ pub struct NotificationChannel {
     pub enabled: bool,
 }
 
+/// Ordered so a "minimum level" filter (e.g. "show warn and above") can
+/// compare variants directly — declaration order is verbosity order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogSource {
+    Agent,
+    Monitor,
+    Docker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub id: Uuid,
+    pub server_id: Uuid,
+    pub source: LogSource,
+    /// Set only for `LogSource::Docker` entries — the container this line
+    /// came from.
+    pub container_name: Option<String>,
+    pub level: LogLevel,
+    pub message: String,
+    pub ts: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLogEntry {
     pub id: Uuid,

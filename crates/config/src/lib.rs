@@ -31,6 +31,10 @@ pub struct MonitorConfig {
     /// How long hourly rollups are kept before being pruned entirely.
     #[serde(default = "default_rollup_retention_days")]
     pub metrics_rollup_retention_days: u64,
+    /// How long log lines (Agent/Monitor/Docker) are kept before being
+    /// pruned — see `monitor_core::scheduler::run_logs_prune`.
+    #[serde(default = "default_logs_retention_hours")]
+    pub logs_retention_hours: u64,
     /// Set only in Monitor+Agent mode: the id of the server row this same
     /// node registered for itself. `monitor run` uses it to drive
     /// self-monitoring straight into the store (see PLAN.md section 5).
@@ -47,6 +51,10 @@ fn default_raw_retention_hours() -> u64 {
 
 fn default_rollup_retention_days() -> u64 {
     30
+}
+
+fn default_logs_retention_hours() -> u64 {
+    72
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

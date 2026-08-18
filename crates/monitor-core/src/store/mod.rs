@@ -8,11 +8,27 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use shared::{
     AlertEvent, AlertRule, DockerContainer, HealthCheck, HealthCheckResult, Incident,
-    IncidentEvent, Metric, NotificationChannel, Server, User,
+    IncidentEvent, LogEntry, LogLevel, LogSource, Metric, NotificationChannel, Server, User,
 };
 use uuid::Uuid;
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// Filter for `Store::list_logs`. Every field is optional except `limit` —
+/// left unset, a filter simply doesn't narrow the query.
+#[derive(Debug, Clone, Default)]
+pub struct LogQuery {
+    pub server_id: Option<Uuid>,
+    pub source: Option<LogSource>,
+    /// Only entries at this level or more severe (see `LogLevel`'s
+    /// declaration order).
+    pub min_level: Option<LogLevel>,
+    /// Case-insensitive substring match against the message.
+    pub q: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub limit: u32,
+}
 
 /// Persistence abstraction for the Monitor. The MVP implementation targets
 /// SQLite (see `monitor-core::store::sqlite`, added in Fase 1); PostgreSQL
@@ -189,4 +205,11 @@ pub trait Store: Send + Sync {
     async fn add_group_member(&self, group_id: Uuid, server_id: Uuid) -> StoreResult<()>;
     async fn remove_group_member(&self, group_id: Uuid, server_id: Uuid) -> StoreResult<()>;
     async fn list_group_members(&self, group_id: Uuid) -> StoreResult<Vec<Server>>;
+
+    // -- logs ---------------------------------------------------------------
+    async fn insert_logs(&self, entries: &[LogEntry]) -> StoreResult<()>;
+    async fn list_logs(&self, query: &LogQuery) -> StoreResult<Vec<LogEntry>>;
+    /// Deletes every log line older than `before`. Returns the number of
+    /// rows deleted, for the scheduler's log message.
+    async fn prune_logs(&self, before: DateTime<Utc>) -> StoreResult<u64>;
 }

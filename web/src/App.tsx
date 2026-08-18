@@ -7,8 +7,9 @@ import { AlertsView } from './components/AlertsView'
 import { IncidentsView } from './components/IncidentsView'
 import { HealthChecksView } from './components/HealthChecksView'
 import { GroupsView } from './components/GroupsView'
+import { LogsView } from './components/LogsView'
 
-type Tab = 'infrastructure' | 'alerts' | 'incidents' | 'healthchecks' | 'groups'
+type Tab = 'infrastructure' | 'alerts' | 'incidents' | 'healthchecks' | 'groups' | 'logs'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'infrastructure', label: 'Infrastructure' },
@@ -16,6 +17,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'incidents', label: 'Incidents' },
   { id: 'healthchecks', label: 'Health Checks' },
   { id: 'groups', label: 'Groups' },
+  { id: 'logs', label: 'Logs' },
 ]
 
 export default function App() {
@@ -84,6 +86,7 @@ export default function App() {
       {tab === 'incidents' && <IncidentsView />}
       {tab === 'healthchecks' && <HealthChecksView />}
       {tab === 'groups' && <GroupsView />}
+      {tab === 'logs' && <LogsView />}
     </div>
   )
 }
