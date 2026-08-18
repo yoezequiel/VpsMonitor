@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { connectStatusStream, listServers, logout } from '../api'
+import { connectStatusStream, listServers } from '../api'
 import type { Server, ServerStatus } from '../types'
 import { StatusDot } from './StatusDot'
 
@@ -22,6 +22,7 @@ export function ServerList({
 }: {
   onSelect: (id: string) => void
   onLoggedOut: () => void
+  embedded?: boolean
 }) {
   const [servers, setServers] = useState<Server[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -56,18 +57,7 @@ export function ServerList({
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
-        <h1 style={{ fontSize: 20, margin: 0 }}>Infrastructure</h1>
-        <button
-          onClick={async () => {
-            await logout()
-            onLoggedOut()
-          }}
-          style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer' }}
-        >
-          Sign out
-        </button>
-      </div>
+      <h1 style={{ fontSize: 20, margin: '0 0 16px' }}>Infrastructure</h1>
 
       <div className="card" style={{ display: 'flex', gap: 24, marginBottom: 16 }}>
         <SummaryStat color="var(--status-good)" label="Online" value={countByStatus(servers, 'online')} />

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { getServer, listMetrics } from '../api'
-import type { Metric, Server } from '../types'
+import { getServer, listDockerContainers, listMetrics, setServerTags } from '../api'
+import type { ContainerState, DockerContainer, Metric, Server } from '../types'
 import { StatusDot } from './StatusDot'
 import { LineChart } from './LineChart'
 
@@ -25,11 +25,14 @@ function formatBytes(bytes: number): string {
 export function ServerDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const [server, setServer] = useState<Server | null>(null)
   const [metrics, setMetrics] = useState<Metric[]>([])
+  const [containers, setContainers] = useState<DockerContainer[]>([])
   const [rangeHours, setRangeHours] = useState(1)
 
-  useEffect(() => {
+  function refreshServer() {
     getServer(id).then(setServer)
-  }, [id])
+  }
+
+  useEffect(refreshServer, [id])
 
   useEffect(() => {
     let cancelled = false
@@ -46,6 +49,21 @@ export function ServerDetail({ id, onBack }: { id: string; onBack: () => void })
       clearInterval(interval)
     }
   }, [id, rangeHours])
+
+  useEffect(() => {
+    let cancelled = false
+    function refresh() {
+      listDockerContainers(id).then((data) => {
+        if (!cancelled) setContainers(data)
+      })
+    }
+    refresh()
+    const interval = setInterval(refresh, 30_000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [id])
 
   if (!server) return null
 
@@ -69,6 +87,8 @@ export function ServerDetail({ id, onBack }: { id: string; onBack: () => void })
         </div>
         <StatusDot status={server.status} />
       </div>
+
+      <TagsEditor server={server} onChanged={refreshServer} />
 
       <div className="card" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 16 }}>
         <StatTile label="CPU" value={latest ? `${latest.cpu_pct.toFixed(0)}%` : '—'} />
@@ -117,6 +137,40 @@ export function ServerDetail({ id, onBack }: { id: string; onBack: () => void })
           data={metrics.map((m) => ({ ts: m.ts, value: (m.mem_used / m.mem_total) * 100 }))}
         />
       </div>
+
+      {containers.length > 0 && (
+        <div className="card" style={{ marginTop: 16, padding: 0 }}>
+          <h2 style={{ fontSize: 15, margin: 0, padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
+            Docker containers
+          </h2>
+          {containers.map((c) => (
+            <div
+              key={c.container_id}
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '10px 16px',
+                borderBottom: '1px solid var(--border)',
+                gap: 12,
+              }}
+            >
+              <div>
+                <div style={{ fontWeight: 600 }}>{c.name}</div>
+                <div className="muted" style={{ fontSize: 12 }}>
+                  {c.image}
+                  {c.restart_count > 0 ? ` · ${c.restart_count} restart(s)` : ''}
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 16, fontSize: 13 }}>
+                <span className="secondary">{c.cpu_pct.toFixed(0)}% CPU</span>
+                <span className="secondary">{formatBytes(c.mem_used)} mem</span>
+                <ContainerStateDot state={c.state} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -134,5 +188,106 @@ function StatTile({ label, value, sub }: { label: string; value: string; sub?: s
         </div>
       )}
     </div>
+  )
+}
+
+const CONTAINER_STATE_COLOR: Record<ContainerState, string> = {
+  running: 'var(--status-good)',
+  restarting: 'var(--status-warning)',
+  paused: 'var(--status-warning)',
+  stopped: 'var(--status-critical)',
+  unknown: 'var(--status-unknown)',
+}
+
+function ContainerStateDot({ state }: { state: ContainerState }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <span
+        aria-hidden
+        style={{ width: 7, height: 7, borderRadius: '50%', background: CONTAINER_STATE_COLOR[state] }}
+      />
+      <span className="secondary" style={{ textTransform: 'capitalize' }}>
+        {state}
+      </span>
+    </span>
+  )
+}
+
+function TagsEditor({ server, onChanged }: { server: Server; onChanged: () => void }) {
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function commit(tags: string[]) {
+    setBusy(true)
+    try {
+      await setServerTags(server.id, tags)
+      onChanged()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function addTag(e: React.FormEvent) {
+    e.preventDefault()
+    const tag = draft.trim()
+    if (!tag || server.tags.includes(tag)) {
+      setDraft('')
+      return
+    }
+    setDraft('')
+    commit([...server.tags, tag])
+  }
+
+  function removeTag(tag: string) {
+    commit(server.tags.filter((t) => t !== tag))
+  }
+
+  return (
+    <form
+      onSubmit={addTag}
+      style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 16 }}
+    >
+      {server.tags.map((tag) => (
+        <span
+          key={tag}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '3px 8px',
+            borderRadius: 999,
+            border: '1px solid var(--border)',
+            background: 'var(--surface-1)',
+            fontSize: 12,
+          }}
+        >
+          {tag}
+          <button
+            type="button"
+            onClick={() => removeTag(tag)}
+            disabled={busy}
+            aria-label={`Remove tag ${tag}`}
+            style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: 0, lineHeight: 1 }}
+          >
+            ×
+          </button>
+        </span>
+      ))}
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder="add tag…"
+        disabled={busy}
+        style={{
+          border: '1px dashed var(--border)',
+          borderRadius: 999,
+          padding: '3px 8px',
+          fontSize: 12,
+          background: 'transparent',
+          color: 'inherit',
+          width: 90,
+        }}
+      />
+    </form>
   )
 }

@@ -185,19 +185,21 @@ Objetivo: un usuario instala Monitor+Agent en su máquina, añade un segundo Age
 
 ### Fase 2 — V2: observabilidad y alertas (según sección 42)
 
-- [x] Docker monitoring (collector vía Docker API: contenedores, estado, cpu/mem/red, reinicios). Backend + reporte del Agent completos; sin UI en el dashboard todavía.
-- [x] Health checks HTTP/HTTPS/TCP/Ping/DNS + scheduler de ejecución periódica. Ping vía socket ICMP sin privilegios (`surge-ping`); backend + API completos, sin UI en el dashboard todavía.
-- [x] Motor de reglas de alertas (umbral + duración, ej. "CPU > 90% for 5 minutes") con evaluación en el scheduler.
-- [x] Notificadores: Email (SMTP vía `lettre`), Webhook genérico.
-- [x] Agrupación automática de alertas relacionadas en incidentes + timeline.
-- [x] Tags en servidores + filtrado. Filtrado por API (`?tags=`) y CLI (`monitor server add`/API `PATCH tags`); sin UI en el dashboard todavía.
-- [x] Grupos de servidores. CRUD + membresía por API; sin UI en el dashboard todavía.
+- [x] Docker monitoring (collector vía Docker API: contenedores, estado, cpu/mem/red, reinicios). Backend + reporte del Agent + UI (lista de contenedores por servidor) completos.
+- [x] Health checks HTTP/HTTPS/TCP/Ping/DNS + scheduler de ejecución periódica. Ping vía socket ICMP sin privilegios (`surge-ping`); backend + API + UI (alta/baja, uptime 24h por check) completos.
+- [x] Motor de reglas de alertas (umbral + duración, ej. "CPU > 90% for 5 minutes") con evaluación en el scheduler. UI: alta/baja de reglas por tipo de condición, eventos recientes.
+- [x] Notificadores: Email (SMTP vía `lettre`), Webhook genérico. UI: alta de canales.
+- [x] Agrupación automática de alertas relacionadas en incidentes + timeline. UI: lista + timeline expandible.
+- [x] Tags en servidores + filtrado. Filtrado por API (`?tags=`) y CLI (`monitor server add`/API `PATCH tags`); UI: editor de tags en el detalle del servidor.
+- [x] Grupos de servidores. CRUD + membresía por API y UI.
 - [ ] Vista de logs (Agent/Monitor/Docker) con filtros por fecha/nivel/servidor/texto. **Diferido**: requiere una infraestructura de log-shipping (el Agent no captura ni envía sus propios logs, el Monitor no persiste los suyos) que es un subsistema propio, no una extensión menor de lo ya construido.
 - [x] Retención/downsampling real de `metrics` (crudo → agregados) para no crecer sin control.
 
-**Criterio de salida**: ✅ verificado con un test de integración real (`alerting::tests::container_stopped_fires_webhook_and_opens_incident`) — una regla de alerta dispara un webhook real cuando un contenedor se detiene, y aparece agrupada en un incidente con timeline coherente que se resuelve solo cuando el contenedor vuelve.
+**Criterio de salida**: ✅ verificado con un test de integración real (`alerting::tests::container_stopped_fires_webhook_and_opens_incident`) — una regla de alerta dispara un webhook real cuando un contenedor se detiene, y aparece agrupada en un incidente con timeline coherente que se resuelve solo cuando el contenedor vuelve. UI verificada con smoke test en vivo (`monitor install` + `monitor run` + llamadas reales a cada endpoint nuevo).
 
-**Pendiente para cerrar V2 del todo**: UI en el dashboard para Docker/health checks/alertas/incidentes/tags/grupos (todo el backend y la API ya existen), y la vista de logs completa.
+**Pendiente para cerrar V2 del todo**: solo la vista de logs (diferida, ver arriba).
+
+**Nota de seguridad**: alerta Dependabot #1 (`glib` 0.18.5, GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429) descartada — es transitiva vía el stack GTK/WebKitGTK de Tauri en Linux (`gtk` 0.18.2, fijado por `tauri` 2.11.5, la versión más reciente), nuestro código nunca usa `glib::Variant`/`VariantStrIter` (la API insegura), y el fix requiere `glib` 0.20+ que exige un salto de gtk-rs que Tauri no ha adoptado todavía (confirmado con `cargo update -p glib --precise 0.20.0`, que falla por el pin `^0.18` de `gtk`). Revisar cuando Tauri actualice su dependencia de GTK.
 
 ### Fase 3 — V3: automatización y seguridad avanzada (según sección 43)
 
